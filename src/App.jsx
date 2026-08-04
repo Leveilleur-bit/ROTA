@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import { storage } from "./storage";
 
 // Différé : garde la saisie fluide en recalculant le planning en arrière-plan.
@@ -37,8 +37,23 @@ const SEED_INTERNS = [
 
 // wd : 0=Lun … 5=Sam 6=Dim
 const DEFAULT_WEIGHTS = { week: 1, sat: 2.2, sun: 2.2, holiday: 2.6 };
-const DOW = ["L", "M", "M", "J", "V", "S", "D"];
-const MONTH_NAMES = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
+const DOW_NAMES = {
+  fr: ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"],
+  en: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+};
+const DOW = DOW_NAMES.fr; // défaut (usages hors composant)
+// Couleur de texte lisible (sombre ou clair) selon la luminance d'un fond.
+function textOn(hex) {
+  const h = String(hex).replace("#", "");
+  if (h.length < 6) return "#0e1116";
+  const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  const L = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return L > 0.62 ? "#0e1116" : "#f4ede4";
+}
+const MONTH_NAMES = {
+  fr: ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"],
+  en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+};
 
 // Dimanche de Pâques (algorithme de Gauss / computus grégorien).
 function easter(y) {
@@ -85,7 +100,7 @@ function buildExercise(startISO, endISO) {
       const inRange = dt >= start && dt <= end;
       return { date, wd: (firstWd + i) % 7, holiday: hol.has(m + "-" + date), inRange };
     });
-    months.push({ year: y, monthIdx: m, name: MONTH_NAMES[m], len, start: firstWd, days });
+    months.push({ year: y, monthIdx: m, name: MONTH_NAMES.fr[m], len, start: firstWd, days });
     m++;
     if (m > 11) { m = 0; y++; }
   }
@@ -115,98 +130,122 @@ function weekAnchor(days, dIdx) {
   return w.length ? w[0] : dIdx;
 }
 
-function generateSchedule(interns, days, startScore, unavail, posts, monthIdx, overrides, weights) {
+// Génère tout l'exercice sur une timeline CONTINUE (les jours s'enchaînent d'un
+// mois à l'autre), pour que le repos de sécurité et les semaines d'astreinte
+// franchissent correctement les frontières de mois. Le résultat est redécoupé
+// par mois pour l'affichage, avec un instantané de charge cumulée par mois.
+function simulateSemester(interns, posts, unavail, months, overrides, weights) {
   const W = weights || DEFAULT_WEIGHTS;
-  const score = {}, count = {}, lastGarde = {};
-  interns.forEach((i) => {
-    score[i.id] = startScore ? startScore[i.id] || 0 : i.carry || 0;
-    count[i.id] = 0;
-  });
+  const score = {};
+  interns.forEach((i) => (score[i.id] = i.carry || 0));
   const has = (id) => interns.some((i) => i.id === id);
   const ov = (k) => (overrides ? overrides[k] : undefined);
-  const takenDay = days.map(() => new Set()); // occupation par jour, tous postes
-  const dayAssign = {}; // "dIdx-postId" → internId | null
-  const forcedAt = {};  // "dIdx-postId" → true
-  const unav = (id, dIdx) => unavail && unavail[monthIdx + "-" + id + "-" + dIdx];
 
-  // --- 1) postes hebdomadaires : une personne couvre toute la semaine ---
-  posts.filter((p) => p.cadence === "semaine").forEach((post) => {
-    const seen = new Set();
-    days.forEach((day, dIdx) => {
-      if (day.inRange === false) return;
-      const wk = weekDaysInRange(days, dIdx);
-      const anchor = wk[0];
-      if (anchor == null || seen.has(anchor)) return;
-      seen.add(anchor);
-      const ww = wk.reduce((s, i) => s + weightOf(days[i], W), 0);
-      const okey = ov(monthIdx + "-" + anchor + "-" + post.id);
-      let chosenId = null, forced = false;
-      if (okey !== undefined && okey !== null) {
-        forced = true;
-        chosenId = okey !== "" && has(okey) ? okey : null;
-      } else {
+  // timeline plate : chaque entrée = { mi, dIdx, day } dans l'ordre chronologique
+  const flat = [];
+  months.forEach((m, mi) => m.days.forEach((day, dIdx) => flat.push({ mi, dIdx, day })));
+  const N = flat.length;
+  const takenDay = flat.map(() => new Set());
+  const lastGarde = {}; // interne → index global de sa dernière garde journalière
+  const dayAssign = {}; // "mi-dIdx-postId" → internId | null
+  const forcedAt = {};
+  const monthCount = months.map(() => { const o = {}; interns.forEach((i) => (o[i.id] = 0)); return o; });
+  const snap = months.map(() => null); // instantané de charge cumulée par mois
+
+  const inR = (g) => flat[g].day.inRange !== false;
+  const wOf = (g) => weightOf(flat[g].day, W);
+  const keyOf = (g, postId) => flat[g].mi + "-" + flat[g].dIdx + "-" + postId;
+  const unav = (id, g) => unavail && unavail[flat[g].mi + "-" + id + "-" + flat[g].dIdx];
+
+  // indices (dans la période) de la semaine lun→dim contenant g, à travers les mois
+  function weekIdxs(g) {
+    let s = g;
+    while (s > 0 && flat[s].day.wd !== 0) s--;
+    let e = s;
+    while (e + 1 < N && flat[e + 1].day.wd !== 0) e++;
+    const out = [];
+    for (let i = s; i <= e; i++) if (inR(i)) out.push(i);
+    return out;
+  }
+  // override d'un poste hebdo : n'importe quel jour de la semaine qui en porte un
+  function weeklyOverride(wk, postId) {
+    for (const d of wk) {
+      const o = ov(keyOf(d, postId));
+      if (o !== undefined && o !== null) return { has: true, val: o };
+    }
+    return { has: false };
+  }
+
+  const weeklyPosts = posts.filter((p) => p.cadence === "semaine");
+  const dailyPosts = posts.filter((p) => p.cadence !== "semaine");
+
+  for (let g = 0; g < N; g++) {
+    if (inR(g)) {
+      // 1) postes hebdomadaires : traités une fois, au premier jour utile de leur semaine
+      weeklyPosts.forEach((post) => {
+        const wk = weekIdxs(g);
+        if (wk[0] !== g) return; // uniquement à l'ancre (1er jour en période de la semaine)
+        const ww = wk.reduce((s, i) => s + wOf(i), 0);
+        const o = weeklyOverride(wk, post.id);
+        let chosenId = null, forced = false;
+        if (o.has) {
+          forced = true;
+          chosenId = o.val !== "" && has(o.val) ? o.val : null;
+        } else {
+          const elig = interns
+            .filter((i) => post.requires.every((t) => i.tags.includes(t)))
+            .filter((i) => !wk.some((d) => takenDay[d].has(i.id)))
+            .filter((i) => !wk.some((d) => unav(i.id, d)))
+            .sort((a, b) => score[a.id] - score[b.id]);
+          chosenId = elig[0] ? elig[0].id : null;
+        }
+        if (chosenId) { score[chosenId] += ww; monthCount[flat[g].mi][chosenId] += 1; }
+        wk.forEach((d) => {
+          dayAssign[keyOf(d, post.id)] = chosenId;
+          if (forced) forcedAt[keyOf(d, post.id)] = true;
+          if (chosenId) takenDay[d].add(chosenId);
+        });
+      });
+
+      // 2) postes journaliers (repos "pas la veille" pour les gardes, à travers les mois)
+      const w = wOf(g);
+      dailyPosts.forEach((post) => {
+        const okey = ov(keyOf(g, post.id));
+        if (okey !== undefined && okey !== null) {
+          const id = okey !== "" && has(okey) ? okey : null;
+          if (id) { score[id] += w; monthCount[flat[g].mi][id]++; takenDay[g].add(id); if (post.kind === "garde") lastGarde[id] = g; }
+          dayAssign[keyOf(g, post.id)] = id; forcedAt[keyOf(g, post.id)] = true;
+          return;
+        }
         const elig = interns
           .filter((i) => post.requires.every((t) => i.tags.includes(t)))
-          .filter((i) => !wk.some((d) => takenDay[d].has(i.id)))
-          .filter((i) => !wk.some((d) => unav(i.id, d)))
+          .filter((i) => post.kind !== "garde" || lastGarde[i.id] !== g - 1)
+          .filter((i) => !takenDay[g].has(i.id))
+          .filter((i) => !unav(i.id, g))
           .sort((a, b) => score[a.id] - score[b.id]);
-        chosenId = elig[0] ? elig[0].id : null;
-      }
-      if (chosenId) { score[chosenId] += ww; count[chosenId] += 1; }
-      wk.forEach((i) => {
-        dayAssign[i + "-" + post.id] = chosenId;
-        if (forced) forcedAt[i + "-" + post.id] = true;
-        if (chosenId) takenDay[i].add(chosenId);
+        const chosen = elig[0];
+        if (chosen) {
+          score[chosen.id] += w; monthCount[flat[g].mi][chosen.id]++; takenDay[g].add(chosen.id);
+          if (post.kind === "garde") lastGarde[chosen.id] = g;
+          dayAssign[keyOf(g, post.id)] = chosen.id;
+        } else dayAssign[keyOf(g, post.id)] = null;
+      });
+    }
+    // instantané de charge à la fin de chaque mois
+    if (g === N - 1 || flat[g + 1].mi !== flat[g].mi) snap[flat[g].mi] = { ...score };
+  }
+
+  // 3) redécoupage par mois pour l'affichage
+  return months.map((m, mi) => {
+    const assignments = [];
+    m.days.forEach((day, dIdx) => {
+      if (day.inRange === false) return;
+      posts.forEach((post) => {
+        const k = mi + "-" + dIdx + "-" + post.id;
+        assignments.push({ dIdx, post: post.id, intern: dayAssign[k] ?? null, forced: !!forcedAt[k] });
       });
     });
-  });
-
-  // --- 2) postes journaliers : jour par jour (repos seulement pour une garde) ---
-  days.forEach((day, dIdx) => {
-    if (day.inRange === false) return;
-    const w = weightOf(day, W);
-    posts.filter((p) => p.cadence !== "semaine").forEach((post) => {
-      const okey = ov(monthIdx + "-" + dIdx + "-" + post.id);
-      if (okey !== undefined && okey !== null) {
-        const id = okey !== "" && has(okey) ? okey : null;
-        if (id) { score[id] += w; count[id]++; takenDay[dIdx].add(id); if (post.kind === "garde") lastGarde[id] = dIdx; }
-        dayAssign[dIdx + "-" + post.id] = id; forcedAt[dIdx + "-" + post.id] = true;
-        return;
-      }
-      const elig = interns
-        .filter((i) => post.requires.every((t) => i.tags.includes(t)))
-        .filter((i) => post.kind !== "garde" || lastGarde[i.id] !== dIdx - 1)
-        .filter((i) => !takenDay[dIdx].has(i.id))
-        .filter((i) => !unav(i.id, dIdx))
-        .sort((a, b) => score[a.id] - score[b.id]);
-      const chosen = elig[0];
-      if (chosen) {
-        score[chosen.id] += w; count[chosen.id]++; takenDay[dIdx].add(chosen.id);
-        if (post.kind === "garde") lastGarde[chosen.id] = dIdx;
-        dayAssign[dIdx + "-" + post.id] = chosen.id;
-      } else dayAssign[dIdx + "-" + post.id] = null;
-    });
-  });
-
-  // --- 3) assemblage des assignations (ordre jour → postes) ---
-  const assignments = [];
-  days.forEach((day, dIdx) => {
-    if (day.inRange === false) return;
-    posts.forEach((post) => {
-      const k = dIdx + "-" + post.id;
-      assignments.push({ dIdx, post: post.id, intern: dayAssign[k] ?? null, forced: !!forcedAt[k] });
-    });
-  });
-  return { assignments, score, count };
-}
-
-function simulateSemester(interns, posts, unavail, months, overrides, weights) {
-  let running = {};
-  interns.forEach((i) => (running[i.id] = i.carry || 0));
-  return months.map((m, mi) => {
-    const res = generateSchedule(interns, m.days, running, unavail, posts, mi, overrides, weights);
-    running = { ...res.score };
-    return { ...m, ...res };
+    return { ...m, assignments, score: snap[mi] || { ...score }, count: monthCount[mi] };
   });
 }
 
@@ -227,7 +266,160 @@ function CommitInput({ value, onCommit, style }) {
   );
 }
 
-export default function App() {
+// Dictionnaire de traduction FR / EN.
+const TR = {
+  fr: {
+    appSub: "astreintes équitables · perso",
+    exercise: "Exercice", durationAria: "Durée de l'exercice", months: "mois", days: "jours",
+    themeAria: "Changer de thème", langAria: "Langue",
+    tMois: "Mois", tBourse: "Bourse", tSemestre: "Semestre", tStats: "Stats", tEquipe: "Équipe", tPostes: "Postes",
+    undo: "↶ Annuler", redo: "Rétablir ↷",
+    responsable: "Responsable", validated: "✓ Validé", brouillon: "Brouillon",
+    planifier: "Planifier", indispos: "Indispos",
+    tapDay: "Touche un jour pour voir et modifier les astreintes.",
+    validationTitle: "Validation du mois", each: "Chaque interne se prononce ;", validates: "valide.",
+    pour: "pour", contre: "contre", validerMois: "Valider le mois", annulerValidation: "Annuler la validation",
+    auto: "Auto (algorithme)", leaveEmpty: "— laisser vide —", notQualified: " (non habilité)",
+    manual: "manuel", uncovered: "non couvert", weeklyNote: "Astreinte hebdomadaire — modifier ici réassigne toute la semaine.",
+    swap: "Échanger", listed: "à la bourse", assignTo: "Attribuer à :", noReplacement: "aucun remplaçant habilité",
+    bourseEmpty: "Aucune garde proposée à l'échange pour l'instant.",
+    spreadLabel: "écart final de charge (max − min)", spreadSub: "plus c'est bas, plus c'est équitable",
+    cumLoad: "Charge cumulée", cumUpTo: "cumul jusqu'à", included: "inclus",
+    exportTitle: "Exporter le planning",
+    exportHint: "Agenda (.ics) à importer dans un calendrier, tableau (.csv) pour Excel, ou impression / PDF.",
+    everyone: "Toutes les personnes", only: "seulement", btnIcs: "Agenda .ics", btnCsv: "Tableau .csv",
+    btnPdf: "Imprimer / PDF (planning complet)",
+    statsHintA: "Récapitulatif sur tout l'exercice (", statsHintB: ") : nombre de gardes/astreintes par personne, dont week-ends et fériés, et charge pondérée cumulée.",
+    colPerson: "Personne", colTotal: "Total", colWk: "Sem.", colWE: "WE", colHol: "Fériés", colLoad: "Charge",
+    statNote: "« Charge » = somme pondérée (un dimanche ou un férié compte plus qu'un jour de semaine, selon les pondérations). C'est la vraie mesure d'équité, le « Total » n'étant qu'un décompte brut.",
+    habTitle: "Habilitations",
+    habHint: "Qui peut couvrir quel poste. Coche les habilitations de chaque personne ci-dessous.",
+    addHab: "+ Ajouter une habilitation", addIntern: "+ Ajouter un interne", newHab: "Nouvelle habilitation",
+    ponderationTitle: "Pondération des jours",
+    ponderationHint: "Combien « pèse » une garde selon le jour, pour le calcul d'équité. Un dimanche ou un férié plus lourd sera réparti plus équitablement.",
+    wWeek: "Semaine", wSat: "Samedi", wSun: "Dimanche", wHol: "Férié", resetDefaults: "Valeurs par défaut",
+    postesHint: "Définis les créneaux à couvrir chaque jour et les habilitations requises. Sans tag requis, le poste est ouvert à tout le monde.",
+    typeLabel: "Type", kGarde: "Garde", kAstreinte: "Astreinte",
+    cadenceLabel: "Cadence", cadJour: "Journalière", cadSemaine: "Hebdomadaire",
+    reqHab: "Habilitations requises", addPoste: "+ Ajouter un poste", newPoste: "Nouveau poste",
+    eligibleA: "éligible", eligibleP: "éligibles", nobodyElig: "personne n'est habilité — créneau non couvrable",
+    weekly: "hebdo",
+    footVersion: "Version perso · enregistré automatiquement sur ton appareil", resetData: "Réinitialiser les données",
+    loading: "Chargement…", warnPeriod: "Génère d'abord une période valide.",
+    notQualifiedFor: "n'a pas l'habilitation requise pour",
+    expDate: "Date", expDay: "Jour", expDayType: "Type jour", expSlot: "Poste", expKind: "Créneau", expPerson: "Interne",
+    tHoliday: "Férié", tSat: "Samedi", tSun: "Dimanche", tWeek: "Semaine",
+    pdfTitle: "ROTA — Planning", pdfPeriod: "Période :",
+    noExport: "L'export n'est pas autorisé dans cet environnement.", noPrint: "L'impression n'est pas autorisée dans cet environnement.",
+    dHol: "férié", dWE: "week-end",
+    unavailA: "Touche les jours où ", unavailB: " n'est pas disponible. Le planning les évite.",
+    semIntroA: "L'équité se cumule sur les ", semIntroB: " mois de l'exercice : le report de chaque mois alimente le suivant pour égaliser la charge.",
+    habManageHint: "Renomme, ajoute ou supprime une habilitation. Les internes et les postes se mettent à jour automatiquement.",
+    teamEditHint: "Édite l'équipe : touche le nom pour le changer, règle le report, coche les habilitations. Tout se recalcule en direct.",
+    report: "Report",
+    bourseIntro: "Bourse aux astreintes : propose une astreinte à l'échange (depuis l'onglet Mois, bouton « Échanger »), puis attribue-la ici à un remplaçant.",
+    bourseEmptyFull: "Aucune astreinte proposée pour l'instant. Dans l'onglet Mois, touche un jour puis « Échanger » sur l'astreinte concernée.",
+    offerGivenBy: "cédée par", equityFoot: "Repère pour planifier : assigne en priorité les barres les plus courtes.",
+    loadingT: "Chargement…", defIntern: "Interne", defPoste: "Nouveau poste", defHab: "Habilitation",
+  },
+  en: {
+    appSub: "fair on-call rota · personal",
+    exercise: "Period", durationAria: "Exercise duration", months: "months", days: "days",
+    themeAria: "Toggle theme", langAria: "Language",
+    tMois: "Month", tBourse: "Swaps", tSemestre: "Overview", tStats: "Stats", tEquipe: "Team", tPostes: "Slots",
+    undo: "↶ Undo", redo: "Redo ↷",
+    responsable: "In charge", validated: "✓ Validated", brouillon: "Draft",
+    planifier: "Plan", indispos: "Off days",
+    tapDay: "Tap a day to view and edit the on-call assignments.",
+    validationTitle: "Month validation", each: "Each member votes;", validates: "validates.",
+    pour: "for", contre: "against", validerMois: "Validate month", annulerValidation: "Cancel validation",
+    auto: "Auto (algorithm)", leaveEmpty: "— leave empty —", notQualified: " (not qualified)",
+    manual: "manual", uncovered: "uncovered", weeklyNote: "Weekly on-call — editing here reassigns the whole week.",
+    swap: "Swap", listed: "listed", assignTo: "Assign to:", noReplacement: "no qualified replacement",
+    bourseEmpty: "No shift offered for swap yet.",
+    spreadLabel: "final load gap (max − min)", spreadSub: "lower is fairer",
+    cumLoad: "Cumulative load", cumUpTo: "cumulative through", included: "",
+    exportTitle: "Export the schedule",
+    exportHint: "Calendar (.ics) to import into an agenda, table (.csv) for Excel, or print / PDF.",
+    everyone: "Everyone", only: "only", btnIcs: "Calendar .ics", btnCsv: "Table .csv",
+    btnPdf: "Print / PDF (full schedule)",
+    statsHintA: "Summary over the whole period (", statsHintB: "): number of shifts per person, incl. weekends and holidays, and cumulative weighted load.",
+    colPerson: "Person", colTotal: "Total", colWk: "Wk", colWE: "WE", colHol: "Hol.", colLoad: "Load",
+    statNote: "\"Load\" = weighted sum (a Sunday or holiday counts more than a weekday, per the weightings). It is the real fairness measure; \"Total\" is only a raw count.",
+    habTitle: "Qualifications",
+    habHint: "Who can cover which slot. Tick each person's qualifications below.",
+    addHab: "+ Add a qualification", addIntern: "+ Add a person", newHab: "New qualification",
+    ponderationTitle: "Day weighting",
+    ponderationHint: "How much a shift \"weighs\" depending on the day, for the fairness calculation. A heavier Sunday or holiday will be shared out more evenly.",
+    wWeek: "Weekday", wSat: "Saturday", wSun: "Sunday", wHol: "Holiday", resetDefaults: "Reset to defaults",
+    postesHint: "Define the slots to cover each day and the required qualifications. With no required tag, the slot is open to everyone.",
+    typeLabel: "Type", kGarde: "On-site", kAstreinte: "On-call",
+    cadenceLabel: "Cadence", cadJour: "Daily", cadSemaine: "Weekly",
+    reqHab: "Required qualifications", addPoste: "+ Add a slot", newPoste: "New slot",
+    eligibleA: "eligible", eligibleP: "eligible", nobodyElig: "nobody is qualified — slot cannot be covered",
+    weekly: "weekly",
+    footVersion: "Personal version · saved automatically on your device", resetData: "Reset all data",
+    loading: "Loading…", warnPeriod: "Set a valid period first.",
+    notQualifiedFor: "lacks the qualification required for",
+    expDate: "Date", expDay: "Day", expDayType: "Day type", expSlot: "Slot", expKind: "Kind", expPerson: "Person",
+    tHoliday: "Holiday", tSat: "Saturday", tSun: "Sunday", tWeek: "Weekday",
+    pdfTitle: "ROTA — Schedule", pdfPeriod: "Period:",
+    noExport: "Export is not allowed in this environment.", noPrint: "Printing is not allowed in this environment.",
+    dHol: "holiday", dWE: "weekend",
+    unavailA: "Tap the days when ", unavailB: " is unavailable. The schedule avoids them.",
+    semIntroA: "Fairness accumulates over the ", semIntroB: " months of the exercise: each month's carry-over feeds the next to even out the load.",
+    habManageHint: "Rename, add or remove a qualification. People and slots update automatically.",
+    teamEditHint: "Edit the team: tap a name to change it, adjust the carry-over, tick qualifications. Everything recomputes live.",
+    report: "Carry-over",
+    bourseIntro: "Shift swaps: offer an on-call shift (from the Month tab, \"Swap\" button), then assign it here to a replacement.",
+    bourseEmptyFull: "No shift offered yet. In the Month tab, tap a day then \"Swap\" on the relevant shift.",
+    offerGivenBy: "given up by", equityFoot: "Planning cue: assign the shortest bars first.",
+    loadingT: "Loading…", defIntern: "Person", defPoste: "New slot", defHab: "Qualification",
+  },
+};
+
+// Filet de sécurité : en cas d'erreur d'exécution, on affiche un message propre
+// (au lieu d'un écran blanc) avec des options de récupération.
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    // silencieux : l'utilisateur voit le message ci-dessous
+  }
+  clearData = () => {
+    try { if (typeof window !== "undefined" && storage && storage.delete) storage.delete("rota:state"); } catch (e) {}
+    try { if (typeof localStorage !== "undefined") localStorage.removeItem("rota:state"); } catch (e) {}
+    setTimeout(() => window.location.reload(), 120);
+  };
+  render() {
+    if (!this.state.error) return this.props.children;
+    const wrap = { minHeight: "100vh", background: "#0e1116", color: "#f4ede4", fontFamily: "'Spline Sans Mono', monospace", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 };
+    const card = { maxWidth: 380, textAlign: "center" };
+    const btn = { display: "block", width: "100%", margin: "10px 0 0", padding: "12px 0", borderRadius: 10, border: "1px solid #2a323d", background: "#1c232d", color: "#f4ede4", fontFamily: "inherit", fontSize: 14, cursor: "pointer" };
+    return (
+      <div style={wrap}>
+        <div style={card}>
+          <div style={{ fontSize: 34, marginBottom: 8 }}>◷</div>
+          <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>Une erreur est survenue</div>
+          <div style={{ fontSize: 12.5, color: "#8a93a0", lineHeight: 1.5, marginBottom: 6 }}>
+            L'application a rencontré un problème et s'est arrêtée. Tes données sont normalement conservées.
+          </div>
+          <button style={btn} onClick={() => window.location.reload()}>Recharger l'application</button>
+          <button style={{ ...btn, borderColor: "#e0613c", color: "#e0613c" }} onClick={this.clearData}>
+            Vider les données et recharger
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
+function AppInner() {
   const [interns, setInterns] = useState(SEED_INTERNS);
   const [tab, setTab] = useState("mois");
   const [sel, setSel] = useState(null);
@@ -239,6 +431,8 @@ export default function App() {
   const [startISO, setStartISO] = useState("2026-05-01");
   const [endISO, setEndISO] = useState("2026-10-31");
   const [overrides, setOverrides] = useState({}); // "moisIdx-dIdx-posteId" → internId | "" (vide)
+  const histRef = useRef({ past: [], future: [] }); // historique des modifications manuelles
+  const [, bumpHist] = useState(0);
   const [offers, setOffers] = useState([]); // bourse : {id, monthIdx, dIdx, postId, from}
   const [votes, setVotes] = useState({}); // "moisIdx-internId" → "pour"|"contre"
   const [validated, setValidated] = useState({}); // moisIdx → true
@@ -246,6 +440,10 @@ export default function App() {
   const [tagList, setTagList] = useState(SEED_TAGS);
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
   const [theme, setTheme] = useState("dark");
+  const [lang, setLang] = useState("fr");
+  const tx = (k) => (TR[lang] && TR[lang][k]) || TR.fr[k] || k;
+  const MONTHS = MONTH_NAMES[lang] || MONTH_NAMES.fr;
+  const DOWL = DOW_NAMES[lang] || DOW_NAMES.fr;
   const [exportWho, setExportWho] = useState("all");
   const [loaded, setLoaded] = useState(false);
 
@@ -265,6 +463,7 @@ export default function App() {
             if (d.endISO) setEndISO(d.endISO);
             if (d.activePerson) setActivePerson(d.activePerson);
             if (d.overrides) setOverrides(d.overrides);
+            histRef.current = { past: [], future: [] };
             if (d.offers) setOffers(d.offers);
             if (d.votes) setVotes(d.votes);
             if (d.validated) setValidated(d.validated);
@@ -272,6 +471,7 @@ export default function App() {
             if (d.tagList) setTagList(d.tagList);
             if (d.weights) setWeights({ ...DEFAULT_WEIGHTS, ...d.weights });
             if (d.theme) setTheme(d.theme);
+            if (d.lang) setLang(d.lang);
           }
         }
       } catch (e) {
@@ -286,10 +486,10 @@ export default function App() {
   // Sauvegarde automatique (débouncée) à chaque modification.
   useEffect(() => {
     if (!loaded || typeof window === "undefined" || !storage) return;
-    const data = JSON.stringify({ interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme });
+    const data = JSON.stringify({ interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang });
     const t = setTimeout(() => { storage.set("rota:state", data).catch(() => {}); }, 400);
     return () => clearTimeout(t);
-  }, [loaded, interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme]);
+  }, [loaded, interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang]);
 
   async function resetAll() {
     try { if (typeof window !== "undefined" && storage) await storage.delete("rota:state"); } catch (e) {}
@@ -301,6 +501,7 @@ export default function App() {
     setActivePerson(SEED_INTERNS[0].id);
     setSelMonth(0);
     setOverrides({}); setOffers([]); setVotes({}); setValidated({}); setRespo({});
+    histRef.current = { past: [], future: [] };
     setTagList(SEED_TAGS);
     setWeights(DEFAULT_WEIGHTS);
   }
@@ -353,13 +554,31 @@ export default function App() {
   // édition manuelle : force un interne (ou "" = vide, ou null = revenir à l'auto)
   function setOverride(mi, dIdx, postId, value) {
     setOverrides((o) => {
+      histRef.current.past.push(o);
+      if (histRef.current.past.length > 50) histRef.current.past.shift();
+      histRef.current.future = [];
       const n = { ...o };
       const k = mi + "-" + dIdx + "-" + postId;
       if (value === null) delete n[k];
       else n[k] = value;
       return n;
     });
+    bumpHist((x) => x + 1);
   }
+  function undoEdit() {
+    const h = histRef.current;
+    if (!h.past.length) return;
+    setOverrides((o) => { h.future.push(o); return h.past.pop(); });
+    bumpHist((x) => x + 1);
+  }
+  function redoEdit() {
+    const h = histRef.current;
+    if (!h.future.length) return;
+    setOverrides((o) => { h.past.push(o); return h.future.pop(); });
+    bumpHist((x) => x + 1);
+  }
+  const canUndo = histRef.current.past.length > 0;
+  const canRedo = histRef.current.future.length > 0;
 
   // bourse : proposer une garde à l'échange
   function offerShift(mi, dIdx, postId) {
@@ -415,7 +634,7 @@ export default function App() {
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1500);
     } catch (e) {
-      alert("L'export n'est pas autorisé dans cet environnement.");
+      alert(tx("noExport"));
     }
   }
   function collectEvents() {
@@ -434,11 +653,15 @@ export default function App() {
   function exportICS() {
     const evs = collectEvents();
     const iso = (d) => "" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate());
+    const now = new Date();
+    const stamp = iso(now) + "T" + pad2(now.getHours()) + pad2(now.getMinutes()) + pad2(now.getSeconds());
     let s = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//ROTA//FR\r\nCALSCALE:GREGORIAN\r\n";
-    evs.forEach((e, k) => {
+    evs.forEach((e) => {
       const nd = new Date(e.date); nd.setDate(nd.getDate() + 1);
-      const kind = (e.p.kind || "garde") === "astreinte" ? "Astreinte" : "Garde";
-      s += "BEGIN:VEVENT\r\nUID:rota-" + k + "-" + Date.now() + "@rota\r\n";
+      const kind = (e.p.kind || "garde") === "astreinte" ? tx("kAstreinte") : tx("kGarde");
+      // UID stable (date + poste) : réimporter met à jour au lieu de dupliquer
+      s += "BEGIN:VEVENT\r\nUID:rota-" + iso(e.date) + "-" + e.p.id + "@rota\r\n";
+      s += "DTSTAMP:" + stamp + "\r\n";
       s += "DTSTART;VALUE=DATE:" + iso(e.date) + "\r\nDTEND;VALUE=DATE:" + iso(nd) + "\r\n";
       s += "SUMMARY:" + e.p.label + " \u00b7 " + e.it.name + " (" + kind + ")\r\nEND:VEVENT\r\n";
     });
@@ -447,21 +670,61 @@ export default function App() {
   }
   function exportCSV() {
     const evs = collectEvents();
-    const rows = ["Date;Jour;Type jour;Poste;Creneau;Interne"];
+    const rows = [[tx("expDate"), tx("expDay"), tx("expDayType"), tx("expSlot"), tx("expKind"), tx("expPerson")].join(";")];
     evs.forEach((e) => {
       const d = e.date;
       const dd = pad2(d.getDate()) + "/" + pad2(d.getMonth() + 1) + "/" + d.getFullYear();
-      const tj = e.day.holiday ? "Ferie" : e.day.wd === 5 ? "Samedi" : e.day.wd === 6 ? "Dimanche" : "Semaine";
-      const kind = (e.p.kind || "garde") === "astreinte" ? "Astreinte" : "Garde";
-      rows.push([dd, DOW[e.day.wd], tj, e.p.label, kind, e.it.name].join(";"));
+      const tj = e.day.holiday ? tx("tHoliday") : e.day.wd === 5 ? tx("tSat") : e.day.wd === 6 ? tx("tSun") : tx("tWeek");
+      const kind = (e.p.kind || "garde") === "astreinte" ? tx("kAstreinte") : tx("kGarde");
+      rows.push([dd, DOWL[e.day.wd], tj, e.p.label, kind, e.it.name].join(";"));
     });
     download("astreintes.csv", "\ufeff" + rows.join("\r\n"), "text/csv");
+  }
+  function exportPDF() {
+    const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    let body = "<h1>" + esc(tx("pdfTitle")) + "</h1>";
+    body += '<div class="sub">' + esc(tx("pdfPeriod")) + " " + startISO.split("-").reverse().join("/") + " → " + endISO.split("-").reverse().join("/") + "</div>";
+    sem.forEach((m) => {
+      body += "<h2>" + esc(MONTHS[m.monthIdx]) + " " + m.year + "</h2>";
+      body += "<table><thead><tr><th>" + esc(tx("expDay")) + "</th>" + posts.map((p) => "<th>" + esc(p.label) + "</th>").join("") + "</tr></thead><tbody>";
+      m.days.forEach((day, dIdx) => {
+        if (day.inRange === false) return;
+        const cls = day.holiday ? "hol" : day.wd >= 5 ? "we" : "";
+        const cells = posts.map((p) => {
+          const a = m.assignments.find((x) => x.dIdx === dIdx && x.post === p.id);
+          const it = a && a.intern != null ? byId(a.intern) : null;
+          return "<td>" + (it ? esc(it.name) : "—") + "</td>";
+        }).join("");
+        body += '<tr class="' + cls + '"><td class="d">' + day.date + " " + DOWL[day.wd] + "</td>" + cells + "</tr>";
+      });
+      body += "</tbody></table>";
+    });
+    const html =
+      '<!doctype html><html lang="' + lang + '"><head><meta charset="utf-8"><title>' + esc(tx("pdfTitle")) + '</title><style>' +
+      "*{font-family:Arial,Helvetica,sans-serif;} h1{font-size:20px;margin:0 0 2px;} .sub{color:#555;font-size:12px;margin-bottom:14px;}" +
+      "h2{font-size:15px;margin:18px 0 6px;} table{border-collapse:collapse;width:100%;font-size:11px;margin-bottom:10px;}" +
+      "th,td{border:1px solid #ccc;padding:4px 6px;text-align:left;} th{background:#f0f0f0;} td.d{white-space:nowrap;color:#333;}" +
+      "tr.we td{background:#f6f1e6;} tr.hol td{background:#f3e4d6;} @media print{h2{page-break-after:avoid;}}" +
+      "</style></head><body>" + body + "</body></html>";
+    try {
+      const frame = document.createElement("iframe");
+      frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
+      document.body.appendChild(frame);
+      const d = frame.contentWindow.document;
+      d.open(); d.write(html); d.close();
+      frame.onload = () => {
+        try { frame.contentWindow.focus(); frame.contentWindow.print(); } catch (e) {}
+        setTimeout(() => { try { document.body.removeChild(frame); } catch (e) {} }, 1500);
+      };
+    } catch (e) {
+      alert(tx("noPrint"));
+    }
   }
 
   // gestion des habilitations (tags) — propagation aux internes et postes
   function addTag() {
     setTagList((l) => {
-      let base = "Habilitation", n = l.length + 1, name = base + " " + n;
+      let base = tx("defHab"), n = l.length + 1, name = base + " " + n;
       while (l.includes(name)) { n++; name = base + " " + n; }
       return [...l, name];
     });
@@ -496,7 +759,7 @@ export default function App() {
   function addIntern() {
     const id = Math.max(0, ...interns.map((i) => i.id)) + 1;
     const color = PALETTE[interns.length % PALETTE.length];
-    setInterns((p) => [...p, { id, name: "Interne " + id, tags: [], carry: 0, color }]);
+    setInterns((p) => [...p, { id, name: tx("defIntern") + " " + id, tags: [], carry: 0, color }]);
   }
   function removeIntern(id) {
     setInterns((p) => (p.length > 1 ? p.filter((i) => i.id !== id) : p));
@@ -530,7 +793,7 @@ export default function App() {
   function addPost() {
     const id = "p" + Date.now();
     const color = PALETTE[posts.length % PALETTE.length];
-    setPosts((p) => [...p, { id, label: "Nouveau poste", requires: [], color, kind: "garde", cadence: "jour" }]);
+    setPosts((p) => [...p, { id, label: tx("defPoste"), requires: [], color, kind: "garde", cadence: "jour" }]);
   }
   function removePost(id) {
     setPosts((p) => (p.length > 1 ? p.filter((x) => x.id !== id) : p));
@@ -557,6 +820,22 @@ export default function App() {
   }
 
   const lastSem = sem.length ? sem[sem.length - 1] : null;
+  const perPerson = useMemo(() => {
+    const acc = {};
+    interns.forEach((i) => (acc[i.id] = { total: 0, we: 0, hol: 0, wk: 0 }));
+    sem.forEach((m) => {
+      m.assignments.forEach((a) => {
+        if (a.intern == null || !acc[a.intern]) return;
+        const day = m.days[a.dIdx];
+        if (!day) return;
+        acc[a.intern].total++;
+        if (day.holiday) acc[a.intern].hol++;
+        else if (day.wd >= 5) acc[a.intern].we++;
+        else acc[a.intern].wk++;
+      });
+    });
+    return acc;
+  }, [sem, interns]);
   const finalScores = lastSem ? interns.map((i) => lastSem.score[i.id] || 0) : [0];
   const spread = (Math.max(...finalScores) - Math.min(...finalScores)).toFixed(1);
   const maxMonthCount = Math.max(
@@ -565,10 +844,10 @@ export default function App() {
   );
 
   function heatBg(n) {
-    const t = n / maxMonthCount;
-    if (t > 0.75) return "var(--hot)";
-    if (t > 0.45) return "var(--mid)";
-    if (t > 0) return "var(--cool)";
+    const r = n / maxMonthCount;
+    if (r > 0.75) return "var(--hot)";
+    if (r > 0.45) return "var(--mid)";
+    if (r > 0) return "var(--cool)";
     return "var(--panel2)";
   }
 
@@ -578,7 +857,7 @@ export default function App() {
         <style>{CSS}</style>
         <div style={S.splash}>
           <div style={S.logoMark}>◷</div>
-          <div style={S.splashText}>Chargement…</div>
+          <div style={S.splashText}>{tx("loadingT")}</div>
         </div>
       </div>
     );
@@ -593,14 +872,21 @@ export default function App() {
           <div style={S.logoMark}>◷</div>
           <div>
             <div style={S.appName}>ROTA</div>
-            <div style={S.appSub}>astreintes équitables · perso</div>
+            <div style={S.appSub}>{tx("appSub")}</div>
           </div>
         </div>
         <div style={S.headRight}>
           <button
-            onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
+            onClick={() => setLang((l) => (l === "fr" ? "en" : "fr"))}
+            style={S.langBtn}
+            aria-label={tx("langAria")}
+          >
+            🌐 {lang === "fr" ? "FR" : "EN"}
+          </button>
+          <button
+            onClick={() => setTheme((th) => (th === "light" ? "dark" : "light"))}
             style={S.themeBtn}
-            aria-label="Changer de thème"
+            aria-label={tx("themeAria")}
           >
             {theme === "light" ? "☾" : "☀"}
           </button>
@@ -608,10 +894,10 @@ export default function App() {
             value={String(months.length)}
             onChange={(e) => setDuration(Number(e.target.value))}
             style={S.monthSelect}
-            aria-label="Durée de l'exercice"
+            aria-label={tx("durationAria")}
           >
             {Array.from(new Set([1, 3, 6, 12, months.length])).sort((a, b) => a - b).map((n) => (
-              <option key={n} value={n}>{n} mois</option>
+              <option key={n} value={n}>{n} {tx("months")}</option>
             ))}
           </select>
         </div>
@@ -619,7 +905,7 @@ export default function App() {
 
       {/* barre Exercice : période de planification */}
       <section style={S.exerciseBar}>
-        <span style={S.exLabel}>Exercice</span>
+        <span style={S.exLabel}>{tx("exercise")}</span>
         <input
           type="date"
           value={startISO}
@@ -639,11 +925,12 @@ export default function App() {
 
       <nav style={S.tabs}>
         {[
-          ["mois", "Mois"],
-          ["bourse", "Bourse" + (offers.length ? " (" + offers.length + ")" : "")],
-          ["semestre", "Semestre"],
-          ["equipe", "Équipe"],
-          ["postes", "Postes"],
+          ["mois", tx("tMois")],
+          ["bourse", tx("tBourse") + (offers.length ? " (" + offers.length + ")" : "")],
+          ["semestre", tx("tSemestre")],
+          ["stats", tx("tStats")],
+          ["equipe", tx("tEquipe")],
+          ["postes", tx("tPostes")],
         ].map(([k, l]) => (
           <button
             key={k}
@@ -660,7 +947,7 @@ export default function App() {
         <section style={S.body}>
           {!valid || !cur ? (
             <div style={S.warn}>
-              Choisis une date de fin postérieure à la date de début pour générer la période.
+              {tx("warnPeriod")}
             </div>
           ) : (
           <>
@@ -674,8 +961,8 @@ export default function App() {
               ‹
             </button>
             <div style={S.monthTitle}>
-              <span style={S.monthTitleName}>{cur.name} {cur.year}</span>
-              <span style={S.monthTitleSub}>{cur.len} jours · mois {safeMonth + 1}/{months.length}</span>
+              <span style={S.monthTitleName}>{MONTHS[cur.monthIdx]} {cur.year}</span>
+              <span style={S.monthTitleSub}>{cur.len} {tx("days")} · {tx("months")} {safeMonth + 1}/{months.length}</span>
             </div>
             <button
               onClick={() => { setSelMonth((m) => Math.min(months.length - 1, m + 1)); setSel(null); }}
@@ -686,10 +973,18 @@ export default function App() {
             </button>
           </div>
 
+          {/* annuler / rétablir les modifications manuelles */}
+          <div style={S.histBar}>
+            <button onClick={undoEdit} disabled={!canUndo}
+              style={{ ...S.histBtn, ...(canUndo ? {} : S.histOff) }}>{tx("undo")}</button>
+            <button onClick={redoEdit} disabled={!canRedo}
+              style={{ ...S.histBtn, ...(canRedo ? {} : S.histOff) }}>{tx("redo")}</button>
+          </div>
+
           {/* responsable du mois + statut de validation */}
           <div style={{ ...S.respoBar, borderColor: validated[safeMonth] ? "var(--cool)" : "var(--line)" }}>
             <div style={S.respoLeft}>
-              <span style={S.respoLabel}>Responsable</span>
+              <span style={S.respoLabel}>{tx("responsable")}</span>
               <select
                 value={respoOf(safeMonth) ?? ""}
                 onChange={(e) => setRespo((r) => ({ ...r, [safeMonth]: Number(e.target.value) }))}
@@ -701,15 +996,15 @@ export default function App() {
               </select>
             </div>
             <span style={{ ...S.statut, ...(validated[safeMonth] ? S.statutOk : {}) }}>
-              {validated[safeMonth] ? "✓ Validé" : "Brouillon"}
+              {validated[safeMonth] ? tx("validated") : tx("brouillon")}
             </span>
           </div>
 
           {/* sélecteur de mode */}
           <div style={S.modeRow}>
             {[
-              ["plan", "Planifier"],
-              ["indispo", "Indispos"],
+              ["plan", tx("planifier")],
+              ["indispo", tx("indispos")],
             ].map(([k, l]) => (
               <button
                 key={k}
@@ -750,13 +1045,13 @@ export default function App() {
               ))
             ) : (
               <span style={S.legendNote}>
-                Touche les jours où <b style={{ color: byId(activePerson)?.color }}>{byId(activePerson)?.name}</b> n'est pas disponible. Le planning les évite.
+                {tx("unavailA")}<b style={{ color: byId(activePerson)?.color }}>{byId(activePerson)?.name}</b>{tx("unavailB")}
               </span>
             )}
           </div>
 
           <div style={S.weekHead}>
-            {DOW.map((d, i) => (
+            {DOWL.map((d, i) => (
               <div key={i} style={S.weekHeadCell}>{d}</div>
             ))}
           </div>
@@ -812,9 +1107,12 @@ export default function App() {
                             style={{
                               ...S.dot,
                               background: who ? who.color : "transparent",
+                              color: who ? textOn(who.color) : "transparent",
                               border: who ? "none" : "1.5px solid var(--hot)",
                             }}
-                          />
+                          >
+                            {who ? who.name.charAt(0).toUpperCase() : ""}
+                          </span>
                         );
                       })}
                     </div>
@@ -830,13 +1128,13 @@ export default function App() {
           {mode === "plan" && (
             <div style={S.detail}>
               {sel === null ? (
-                <div style={S.detailHint}>Touche un jour pour voir et modifier les astreintes.</div>
+                <div style={S.detailHint}>{tx("tapDay")}</div>
               ) : (
                 <>
                   <div style={S.detailHead}>
-                    {cur.name} {cur.days[sel].date} · {DOW[cur.days[sel].wd]}
-                    {cur.days[sel].holiday ? " · férié" : ""}
-                    {(cur.days[sel].wd === 5 || cur.days[sel].wd === 6) ? " · week-end" : ""}
+                    {MONTHS[cur.monthIdx]} {cur.days[sel].date} · {DOWL[cur.days[sel].wd]}
+                    {cur.days[sel].holiday ? " · " + tx("dHol") : ""}
+                    {(cur.days[sel].wd === 5 || cur.days[sel].wd === 6) ? " · " + tx("dWE") : ""}
                   </div>
                   {(assignByDay[sel] || [])
                     .map((x, k) => {
@@ -855,15 +1153,15 @@ export default function App() {
                           <div style={S.editTop}>
                             <span style={S.detailPost}>
                               {p.label}
-                              <span style={S.kindTag}>{(p.kind || "garde") === "astreinte" ? "astreinte" : "garde"}{weekly ? " · hebdo" : ""}</span>
+                              <span style={S.kindTag}>{(p.kind || "garde") === "astreinte" ? tx("kAstreinte") : tx("kGarde")}{weekly ? " · " + tx("weekly") : ""}</span>
                             </span>
                             <span style={S.editTag}>
                               {x.intern && it && (<span style={{ ...S.detailDot, background: it.color }} />)}
-                              {it ? it.name : <span style={S.detailEmpty}>non couvert</span>}
-                              {x.forced && <span style={S.forcedTag}>manuel</span>}
+                              {it ? it.name : <span style={S.detailEmpty}>{tx("uncovered")}</span>}
+                              {x.forced && <span style={S.forcedTag}>{tx("manual")}</span>}
                             </span>
                           </div>
-                          {weekly && <div style={S.weekNote}>Astreinte hebdomadaire — modifier ici réassigne toute la semaine.</div>}
+                          {weekly && <div style={S.weekNote}>{tx("weeklyNote")}</div>}
                           <div style={S.editCtrls}>
                             <select
                               value={selVal}
@@ -873,20 +1171,20 @@ export default function App() {
                               }}
                               style={S.editSelect}
                             >
-                              <option value="auto">Auto (algorithme)</option>
-                              <option value="">— laisser vide —</option>
+                              <option value="auto">{tx("auto")}</option>
+                              <option value="">{tx("leaveEmpty")}</option>
                               {interns.map((i) => {
                                 const ok = p.requires.every((t) => i.tags.includes(t));
-                                return <option key={i.id} value={i.id}>{i.name}{ok ? "" : " (non habilité)"}</option>;
+                                return <option key={i.id} value={i.id}>{i.name}{ok ? "" : tx("notQualified")}</option>;
                               })}
                             </select>
                             {x.intern && (
                               isOffered
-                                ? <span style={S.offeredTag}>à la bourse</span>
-                                : <button style={S.offerBtn} onClick={() => offerShift(safeMonth, editIdx, x.post)}>Échanger</button>
+                                ? <span style={S.offeredTag}>{tx("listed")}</span>
+                                : <button style={S.offerBtn} onClick={() => offerShift(safeMonth, editIdx, x.post)}>{tx("swap")}</button>
                             )}
                           </div>
-                          {badHab && <div style={S.habWarn}>⚠ {it.name} n'a pas l'habilitation requise pour {p.label}</div>}
+                          {badHab && <div style={S.habWarn}>⚠ {it.name} {tx("notQualifiedFor")} {p.label}</div>}
                         </div>
                       );
                     })}
@@ -897,9 +1195,9 @@ export default function App() {
 
           {/* validation collégiale du mois */}
           <div style={S.votePanel}>
-            <div style={S.voteHead}>Validation du mois</div>
+            <div style={S.voteHead}>{tx("validationTitle")}</div>
             <div style={S.voteHint}>
-              Chaque interne se prononce ; {byId(respoOf(safeMonth))?.name || "le responsable"} valide.
+              {tx("each")} {byId(respoOf(safeMonth))?.name || tx("responsable")} {tx("validates")}
             </div>
             <div style={S.voteRow}>
               {interns.map((i) => {
@@ -922,13 +1220,13 @@ export default function App() {
             </div>
             <div style={S.voteFoot}>
               <span style={S.voteTally}>
-                {voteTally(safeMonth).pour} pour · {voteTally(safeMonth).contre} contre
+                {voteTally(safeMonth).pour} {tx("pour")} · {voteTally(safeMonth).contre} {tx("contre")}
               </span>
               <button
                 onClick={() => toggleValidated(safeMonth)}
                 style={{ ...S.validateBtn, ...(validated[safeMonth] ? S.validateBtnOn : {}) }}
               >
-                {validated[safeMonth] ? "Annuler la validation" : "Valider le mois"}
+                {validated[safeMonth] ? tx("annulerValidation") : tx("validerMois")}
               </button>
             </div>
           </div>
@@ -941,13 +1239,11 @@ export default function App() {
       {tab === "bourse" && (
         <section style={S.body}>
           <div style={S.semIntro}>
-            Bourse aux astreintes : propose une astreinte à l'échange (depuis l'onglet Mois,
-            bouton « Échanger »), puis attribue-la ici à un remplaçant.
+            {tx("bourseIntro")}
           </div>
           {offers.length === 0 ? (
             <div style={S.emptyBourse}>
-              Aucune astreinte proposée pour l'instant. Dans l'onglet Mois, touche un jour
-              puis « Échanger » sur l'astreinte concernée.
+              {tx("bourseEmptyFull")}
             </div>
           ) : (
             offers.map((o) => {
@@ -963,9 +1259,9 @@ export default function App() {
                 <div key={o.id} style={S.offerCard}>
                   <div style={S.offerTop}>
                     <div>
-                      <div style={S.offerWhen}>{m.name} {day.date} · {p.label}</div>
+                      <div style={S.offerWhen}>{MONTHS[m.monthIdx]} {day.date} · {p.label}</div>
                       <div style={S.offerFrom}>
-                        cédée par
+                        {tx("offerGivenBy")}
                         <span style={{ ...S.detailDot, background: fromI?.color, margin: "0 4px" }} />
                         {fromI?.name}
                       </div>
@@ -973,10 +1269,10 @@ export default function App() {
                     <button style={S.offerCancel} onClick={() => cancelOffer(o.id)}>✕</button>
                   </div>
                   <div style={S.offerTake}>
-                    <span style={S.offerTakeLabel}>Attribuer à :</span>
+                    <span style={S.offerTakeLabel}>{tx("assignTo")}</span>
                     <div style={S.offerChips}>
                       {elig.length === 0 ? (
-                        <span style={S.detailEmpty}>aucun remplaçant habilité</span>
+                        <span style={S.detailEmpty}>{tx("noReplacement")}</span>
                       ) : (
                         elig.map((i) => (
                           <button key={i.id} style={S.takeChip} onClick={() => takeOffer(o, i.id)}>
@@ -999,20 +1295,19 @@ export default function App() {
         <section style={S.body}>
           {!valid ? (
             <div style={S.warn}>
-              Définis une période d'exercice valide pour voir la synthèse.
+              {tx("warnPeriod")}
             </div>
           ) : (
           <>
           <div style={S.semIntro}>
-            L'équité se cumule sur les {months.length} mois de l'exercice : le
-            report de chaque mois alimente le suivant pour égaliser la charge.
+            {tx("semIntroA")}{months.length}{tx("semIntroB")}
           </div>
 
           {/* mini-calendriers */}
           <div style={S.miniScroll}>
             {sem.map((m, mi) => (
               <div key={mi} style={S.miniMonth}>
-                <div style={S.miniName}>{m.name}</div>
+                <div style={S.miniName}>{MONTHS[m.monthIdx]}</div>
                 <div style={S.miniGrid}>
                   {Array.from({ length: m.start }, (_, b) => (
                     <span key={"b" + b} style={S.miniCell} />
@@ -1040,7 +1335,7 @@ export default function App() {
             <div style={S.matrixRow}>
               <div style={S.mLabel} />
               {sem.map((m, i) => (
-                <div key={i} style={S.mHead}>{m.name.slice(0, 3)}</div>
+                <div key={i} style={S.mHead}>{MONTHS[m.monthIdx].slice(0, 3)}</div>
               ))}
               <div style={S.mTotal}>Σ</div>
             </div>
@@ -1079,28 +1374,75 @@ export default function App() {
           <div style={S.spreadCard}>
             <span style={S.spreadNum}>{spread}</span>
             <span style={S.spreadLabel}>
-              écart final de charge (max − min)
+              {tx("spreadLabel")}
               <br />
-              <span style={S.spreadSub}>plus c'est bas, plus c'est équitable</span>
+              <span style={S.spreadSub}>{tx("spreadSub")}</span>
             </span>
           </div>
 
           {/* export du planning */}
           <div style={S.exportCard}>
-            <div style={S.habTitle}>Exporter le planning</div>
+            <div style={S.habTitle}>{tx("exportTitle")}</div>
             <div style={S.habHint}>
-              Agenda (.ics) à importer dans un calendrier, ou tableau (.csv) ouvrable dans Excel.
+              {tx("exportHint")}
             </div>
             <select value={exportWho} onChange={(e) => setExportWho(e.target.value)} style={S.exportSelect}>
-              <option value="all">Toutes les personnes</option>
-              {interns.map((i) => (<option key={i.id} value={i.id}>{i.name} seulement</option>))}
+              <option value="all">{tx("everyone")}</option>
+              {interns.map((i) => (<option key={i.id} value={i.id}>{i.name} {tx("only")}</option>))}
             </select>
             <div style={S.exportBtns}>
-              <button onClick={exportICS} style={S.exportBtn}>Agenda .ics</button>
-              <button onClick={exportCSV} style={S.exportBtn}>Tableau .csv</button>
+              <button onClick={exportICS} style={S.exportBtn}>{tx("btnIcs")}</button>
+              <button onClick={exportCSV} style={S.exportBtn}>{tx("btnCsv")}</button>
             </div>
+            <button onClick={exportPDF} style={S.pdfBtn}>{tx("btnPdf")}</button>
           </div>
           </>
+          )}
+        </section>
+      )}
+
+      {/* ---------------- STATS ---------------- */}
+      {tab === "stats" && (
+        <section style={S.body}>
+          {!valid ? (
+            <div style={S.warn}>{tx("warnPeriod")}</div>
+          ) : (
+            <>
+              <div style={S.teamHint}>
+                {tx("statsHintA")}{months.length} {tx("months")}{tx("statsHintB")}
+              </div>
+              <div style={S.statHead}>
+                <span style={{ ...S.statCell, ...S.statName }}>{tx("colPerson")}</span>
+                <span style={S.statCell}>{tx("colTotal")}</span>
+                <span style={S.statCell}>{tx("colWk")}</span>
+                <span style={S.statCell}>{tx("colWE")}</span>
+                <span style={S.statCell}>{tx("colHol")}</span>
+                <span style={S.statCell}>{tx("colLoad")}</span>
+              </div>
+              {interns
+                .slice()
+                .sort((a, b) => (lastSem ? (lastSem.score[b.id] || 0) - (lastSem.score[a.id] || 0) : 0))
+                .map((i) => {
+                  const s = perPerson[i.id] || { total: 0, we: 0, hol: 0, wk: 0 };
+                  const charge = lastSem ? lastSem.score[i.id] || 0 : 0;
+                  return (
+                    <div key={i.id} style={S.statRow}>
+                      <span style={{ ...S.statCell, ...S.statName }}>
+                        <span style={{ ...S.statDot, background: i.color }} />
+                        {i.name}
+                      </span>
+                      <span style={{ ...S.statCell, ...S.statStrong }}>{s.total}</span>
+                      <span style={S.statCell}>{s.wk}</span>
+                      <span style={S.statCell}>{s.we}</span>
+                      <span style={S.statCell}>{s.hol}</span>
+                      <span style={{ ...S.statCell, color: "var(--accent)" }}>{charge.toFixed(0)}</span>
+                    </div>
+                  );
+                })}
+              <div style={S.statNote}>
+                {tx("statNote")}
+              </div>
+            </>
           )}
         </section>
       )}
@@ -1110,10 +1452,9 @@ export default function App() {
         <section style={S.body}>
           {/* gestion des habilitations */}
           <div style={S.habCard}>
-            <div style={S.habTitle}>Habilitations</div>
+            <div style={S.habTitle}>{tx("habTitle")}</div>
             <div style={S.habHint}>
-              Renomme, ajoute ou supprime une habilitation. Les internes et les postes
-              se mettent à jour automatiquement.
+              {tx("habManageHint")}
             </div>
             <div style={S.habList}>
               {tagList.map((t, k) => (
@@ -1127,12 +1468,11 @@ export default function App() {
                 </div>
               ))}
             </div>
-            <button onClick={addTag} style={S.addBtn}>+ Ajouter une habilitation</button>
+            <button onClick={addTag} style={S.addBtn}>{tx("addHab")}</button>
           </div>
 
           <div style={S.teamHint}>
-            Édite l'équipe : touche le nom pour le changer, règle le report,
-            coche les habilitations. Tout se recalcule en direct.
+            {tx("teamEditHint")}
           </div>
           {interns.map((i) => (
             <div key={i.id} style={S.internCard}>
@@ -1149,7 +1489,7 @@ export default function App() {
               </div>
 
               <div style={S.carryRow}>
-                <span style={S.carryLabel}>Report</span>
+                <span style={S.carryLabel}>{tx("report")}</span>
                 <button onClick={() => bumpCarry(i.id, -1)} style={S.step}>−</button>
                 <span style={S.carryVal}>{i.carry}</span>
                 <button onClick={() => bumpCarry(i.id, 1)} style={S.step}>+</button>
@@ -1171,7 +1511,7 @@ export default function App() {
               </div>
             </div>
           ))}
-          <button onClick={addIntern} style={S.addBtn}>+ Ajouter un interne</button>
+          <button onClick={addIntern} style={S.addBtn}>{tx("addIntern")}</button>
         </section>
       )}
 
@@ -1180,13 +1520,12 @@ export default function App() {
         <section style={S.body}>
           {/* pondération de pénibilité par type de jour */}
           <div style={S.habCard}>
-            <div style={S.habTitle}>Pondération des jours</div>
+            <div style={S.habTitle}>{tx("ponderationTitle")}</div>
             <div style={S.habHint}>
-              Combien « pèse » une garde selon le jour, pour le calcul d'équité.
-              Un dimanche ou un férié plus lourd sera réparti plus équitablement.
+              {tx("ponderationHint")}
             </div>
             <div style={S.wGrid}>
-              {[["week", "Semaine"], ["sat", "Samedi"], ["sun", "Dimanche"], ["holiday", "Férié"]].map(([k, l]) => (
+              {[["week", tx("wWeek")], ["sat", tx("wSat")], ["sun", tx("wSun")], ["holiday", tx("wHol")]].map(([k, l]) => (
                 <div key={k} style={S.wItem}>
                   <span style={S.wLabel}>{l}</span>
                   <input
@@ -1201,12 +1540,11 @@ export default function App() {
                 </div>
               ))}
             </div>
-            <button onClick={() => setWeights(DEFAULT_WEIGHTS)} style={S.wReset}>Valeurs par défaut</button>
+            <button onClick={() => setWeights(DEFAULT_WEIGHTS)} style={S.wReset}>{tx("resetDefaults")}</button>
           </div>
 
           <div style={S.teamHint}>
-            Définis les créneaux à couvrir chaque jour et les habilitations
-            requises. Sans tag requis, le poste est ouvert à tout le monde.
+            {tx("postesHint")}
           </div>
           {posts.map((p) => {
             const eligibleCount = interns.filter((i) =>
@@ -1223,22 +1561,22 @@ export default function App() {
                   <button onClick={() => removePost(p.id)} style={S.del}>✕</button>
                 </div>
 
-                <div style={S.segLabel}>Type</div>
+                <div style={S.segLabel}>{tx("typeLabel")}</div>
                 <div style={S.seg}>
-                  {[["garde", "Garde"], ["astreinte", "Astreinte"]].map(([v, l]) => (
+                  {[["garde", tx("kGarde")], ["astreinte", tx("kAstreinte")]].map(([v, l]) => (
                     <button key={v} onClick={() => setPostField(p.id, "kind", v)}
                       style={{ ...S.segBtn, ...((p.kind || "garde") === v ? S.segOn : {}) }}>{l}</button>
                   ))}
                 </div>
-                <div style={S.segLabel}>Cadence</div>
+                <div style={S.segLabel}>{tx("cadenceLabel")}</div>
                 <div style={S.seg}>
-                  {[["jour", "Journalière"], ["semaine", "Hebdomadaire"]].map(([v, l]) => (
+                  {[["jour", tx("cadJour")], ["semaine", tx("cadSemaine")]].map(([v, l]) => (
                     <button key={v} onClick={() => setPostField(p.id, "cadence", v)}
                       style={{ ...S.segBtn, ...((p.cadence || "jour") === v ? S.segOn : {}) }}>{l}</button>
                   ))}
                 </div>
 
-                <div style={S.reqLabel}>Habilitations requises</div>
+                <div style={S.reqLabel}>{tx("reqHab")}</div>
                 <div style={S.tagRow}>
                   {tagList.map((t) => {
                     const on = p.requires.includes(t);
@@ -1260,13 +1598,13 @@ export default function App() {
                   }}
                 >
                   {eligibleCount === 0
-                    ? "⚠ personne n'est habilité — créneau non couvrable"
-                    : eligibleCount + " interne" + (eligibleCount > 1 ? "s" : "") + " éligible" + (eligibleCount > 1 ? "s" : "")}
+                    ? "⚠ " + tx("nobodyElig")
+                    : eligibleCount + " " + (eligibleCount > 1 ? tx("eligibleP") : tx("eligibleA"))}
                 </div>
               </div>
             );
           })}
-          <button onClick={addPost} style={S.addBtn}>+ Ajouter un poste</button>
+          <button onClick={addPost} style={S.addBtn}>{tx("addPoste")}</button>
         </section>
       )}
 
@@ -1274,7 +1612,7 @@ export default function App() {
       {cur && (
       <section style={S.equityCard}>
         <div style={S.equityTitle}>
-          Charge cumulée <span style={S.equityHint}>cumul jusqu'à {cur.name} inclus</span>
+          {tx("cumLoad")} <span style={S.equityHint}>{tx("cumUpTo")} {MONTHS[cur.monthIdx]} {tx("included")}</span>
         </div>
         {interns
           .slice()
@@ -1299,14 +1637,14 @@ export default function App() {
             );
           })}
         <div style={S.equityFoot}>
-          Repère pour planifier : assigne en priorité les barres les plus courtes.
+          {tx("equityFoot")}
         </div>
       </section>
       )}
 
       <footer style={S.footer}>
-        <button onClick={resetAll} style={S.resetBtn}>Réinitialiser les données</button>
-        <div style={S.footNote}>Version perso · enregistré automatiquement sur ton appareil</div>
+        <button onClick={resetAll} style={S.resetBtn}>{tx("resetData")}</button>
+        <div style={S.footNote}>{tx("footVersion")}</div>
       </footer>
     </div>
   );
@@ -1388,7 +1726,7 @@ const S = {
   legendDot: { width: 9, height: 9, borderRadius: "50%" },
 
   weekHead: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4, marginBottom: 5 },
-  weekHeadCell: { textAlign: "center", fontSize: 10, color: "var(--muted)", letterSpacing: 1 },
+  weekHeadCell: { textAlign: "center", fontSize: 10, color: "var(--muted)", letterSpacing: 0.3 },
   grid: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 },
   blank: { aspectRatio: "1 / 1.15" },
   cell: { aspectRatio: "1 / 1.15", background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 9, padding: "4px 0 0", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "space-between", cursor: "pointer", fontFamily: mono },
@@ -1398,7 +1736,7 @@ const S = {
   cellNumOut: { fontSize: 11, color: "var(--muted)" },
   cellNum: { fontSize: 12, color: "var(--ink)", fontWeight: 500 },
   dots: { display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 3, paddingBottom: 6 },
-  dot: { width: 7, height: 7, borderRadius: "50%", boxSizing: "border-box" },
+  dot: { width: 13, height: 13, borderRadius: "50%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontWeight: 700, lineHeight: 1, fontFamily: mono },
 
   detail: { marginTop: 14, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: 14, minHeight: 70 },
   detailHint: { fontSize: 12, color: "var(--muted)", lineHeight: 1.5 },
@@ -1430,6 +1768,17 @@ const S = {
   exportCard: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: 14, marginTop: 16 },
   exportSelect: { width: "100%", background: "var(--panel2)", color: "var(--ink)", border: "1px solid var(--line)", borderRadius: 9, fontFamily: mono, fontSize: 12.5, padding: "9px 10px", marginBottom: 10 },
   exportBtns: { display: "flex", gap: 8 },
+  pdfBtn: { width: "100%", marginTop: 8, padding: "11px 0", borderRadius: 10, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--ink)", fontFamily: mono, fontSize: 13, fontWeight: 600, cursor: "pointer" },
+  histBar: { display: "flex", gap: 8, marginBottom: 12 },
+  histBtn: { flex: 1, padding: "8px 0", borderRadius: 9, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--ink)", fontFamily: mono, fontSize: 12, cursor: "pointer" },
+  histOff: { opacity: 0.35, cursor: "default" },
+  statHead: { display: "flex", alignItems: "center", padding: "6px 8px", fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.4, borderBottom: "1px solid var(--line)" },
+  statRow: { display: "flex", alignItems: "center", padding: "9px 8px", borderBottom: "1px solid var(--line)", fontFamily: mono, fontSize: 12.5 },
+  statCell: { flex: 1, textAlign: "center", color: "var(--ink)" },
+  statName: { flex: 2.2, textAlign: "left", display: "flex", alignItems: "center", gap: 8 },
+  statStrong: { fontWeight: 700 },
+  statDot: { width: 10, height: 10, borderRadius: "50%", flexShrink: 0 },
+  statNote: { fontSize: 11, color: "var(--muted)", marginTop: 12, lineHeight: 1.5 },
   exportBtn: { flex: 1, padding: "11px 0", borderRadius: 10, border: "1px solid var(--cool)", background: "transparent", color: "var(--cool)", fontFamily: mono, fontSize: 13, fontWeight: 600, cursor: "pointer" },
 
   teamHint: { fontSize: 11.5, color: "var(--muted)", lineHeight: 1.5, marginBottom: 14 },
@@ -1515,3 +1864,11 @@ const S = {
   splash: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, minHeight: "70vh" },
   splashText: { fontSize: 12, color: "var(--muted)" },
 };
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
