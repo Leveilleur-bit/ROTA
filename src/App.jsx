@@ -167,41 +167,94 @@ function simulateSemester(interns, posts, unavail, months, overrides, weights) {
     for (let i = s; i <= e; i++) if (inR(i)) out.push(i);
     return out;
   }
-  // override d'un poste hebdo : n'importe quel jour de la semaine qui en porte un
-  function weeklyOverride(wk, postId) {
-    for (const d of wk) {
-      const o = ov(keyOf(d, postId));
-      if (o !== undefined && o !== null) return { has: true, val: o };
-    }
-    return { has: false };
-  }
 
-  const weeklyPosts = posts.filter((p) => p.cadence === "semaine");
-  const dailyPosts = posts.filter((p) => p.cadence !== "semaine");
+  const inRangeIdx = [];
+  for (let g = 0; g < N; g++) if (inR(g)) inRangeIdx.push(g);
+
+  // Un poste "période" (bloc de N jours ou semaine) : une personne couvre tout un
+  // groupe de jours. On précalcule les groupes et, pour chaque jour, son ancre
+  // (1er jour du groupe) — clé où vit la surcharge manuelle.
+  function periodSpan(post) {
+    return post.cadence === "semaine" ? "semaine" : Math.max(1, Math.round(post.span || 1));
+  }
+  const isWeekend = (g) => flat[g].day.wd === 5 || flat[g].day.wd === 6;
+  const isPeriod = (post) =>
+    post.cadence === "semaine" || post.cadence === "we" || post.cadence === "sem5" || (post.cadence === "bloc" && periodSpan(post) >= 2);
+  // un poste "week-end" n'existe que sam/dim ; un poste "sem5" n'existe qu'en semaine (lun→ven)
+  const appliesOn = (post, day) =>
+    post.cadence === "we" ? (day.wd === 5 || day.wd === 6)
+    : post.cadence === "sem5" ? (day.wd <= 4)
+    : true;
+
+  const groupsByPost = {};
+  posts.filter(isPeriod).forEach((post) => {
+    let groups = [];
+    if (post.cadence === "semaine") {
+      const seen = new Set();
+      inRangeIdx.forEach((g) => {
+        const wk = weekIdxs(g);
+        if (wk.length && !seen.has(wk[0])) { seen.add(wk[0]); groups.push(wk); }
+      });
+    } else if (post.cadence === "we") {
+      // regrouper chaque week-end (samedi+dimanche contigus)
+      let curG = [];
+      const flush = () => { if (curG.length) { groups.push(curG); curG = []; } };
+      inRangeIdx.forEach((g) => {
+        if (isWeekend(g)) {
+          if (curG.length && g !== curG[curG.length - 1] + 1) flush();
+          curG.push(g);
+        } else flush();
+      });
+      flush();
+    } else if (post.cadence === "sem5") {
+      // regrouper les jours ouvrés (lun→ven) de chaque semaine ; le week-end coupe
+      let curG = [];
+      const flush = () => { if (curG.length) { groups.push(curG); curG = []; } };
+      inRangeIdx.forEach((g) => {
+        if (!isWeekend(g)) {
+          if (curG.length && g !== curG[curG.length - 1] + 1) flush();
+          curG.push(g);
+        } else flush();
+      });
+      flush();
+    } else {
+      const n = periodSpan(post);
+      for (let i = 0; i < inRangeIdx.length; i += n) groups.push(inRangeIdx.slice(i, i + n));
+    }
+    const anchorOf = {}, members = {};
+    groups.forEach((gr) => { members[gr[0]] = gr; gr.forEach((idx) => (anchorOf[idx] = gr[0])); });
+    groupsByPost[post.id] = { anchorOf, members };
+  });
+
+  const anchorMeta = {}; // "mi-dIdx-postId" → { mi, dIdx } de l'ancre du groupe
+  const periodPosts = posts.filter(isPeriod);
+  const dailyPosts = posts.filter((p) => !isPeriod(p));
 
   for (let g = 0; g < N; g++) {
     if (inR(g)) {
-      // 1) postes hebdomadaires : traités une fois, au premier jour utile de leur semaine
-      weeklyPosts.forEach((post) => {
-        const wk = weekIdxs(g);
-        if (wk[0] !== g) return; // uniquement à l'ancre (1er jour en période de la semaine)
-        const ww = wk.reduce((s, i) => s + wOf(i), 0);
-        const o = weeklyOverride(wk, post.id);
+      // 1) postes "période" (bloc / semaine) : traités une fois, à l'ancre du groupe
+      periodPosts.forEach((post) => {
+        const gm = groupsByPost[post.id];
+        if (gm.anchorOf[g] !== g) return; // seulement à l'ancre
+        const grp = gm.members[g];
+        const ww = grp.reduce((s, i) => s + wOf(i), 0);
+        const okey = ov(keyOf(g, post.id)); // surcharge lue à l'ancre
         let chosenId = null, forced = false;
-        if (o.has) {
+        if (okey !== undefined && okey !== null) {
           forced = true;
-          chosenId = o.val !== "" && has(o.val) ? o.val : null;
+          chosenId = okey !== "" && has(okey) ? okey : null;
         } else {
           const elig = interns
             .filter((i) => post.requires.every((t) => i.tags.includes(t)))
-            .filter((i) => !wk.some((d) => takenDay[d].has(i.id)))
-            .filter((i) => !wk.some((d) => unav(i.id, d)))
+            .filter((i) => !grp.some((d) => takenDay[d].has(i.id)))
+            .filter((i) => !grp.some((d) => unav(i.id, d)))
             .sort((a, b) => score[a.id] - score[b.id]);
           chosenId = elig[0] ? elig[0].id : null;
         }
         if (chosenId) { score[chosenId] += ww; monthCount[flat[g].mi][chosenId] += 1; }
-        wk.forEach((d) => {
+        grp.forEach((d) => {
           dayAssign[keyOf(d, post.id)] = chosenId;
+          anchorMeta[keyOf(d, post.id)] = { mi: flat[g].mi, dIdx: flat[g].dIdx };
           if (forced) forcedAt[keyOf(d, post.id)] = true;
           if (chosenId) takenDay[d].add(chosenId);
         });
@@ -235,14 +288,16 @@ function simulateSemester(interns, posts, unavail, months, overrides, weights) {
     if (g === N - 1 || flat[g + 1].mi !== flat[g].mi) snap[flat[g].mi] = { ...score };
   }
 
-  // 3) redécoupage par mois pour l'affichage
+  // 3) redécoupage par mois pour l'affichage (avec l'ancre du groupe pour l'édition)
   return months.map((m, mi) => {
     const assignments = [];
     m.days.forEach((day, dIdx) => {
       if (day.inRange === false) return;
       posts.forEach((post) => {
+        if (!appliesOn(post, day)) return;
         const k = mi + "-" + dIdx + "-" + post.id;
-        assignments.push({ dIdx, post: post.id, intern: dayAssign[k] ?? null, forced: !!forcedAt[k] });
+        const anc = anchorMeta[k] || { mi, dIdx };
+        assignments.push({ dIdx, post: post.id, intern: dayAssign[k] ?? null, forced: !!forcedAt[k], anchorMi: anc.mi, anchorDIdx: anc.dIdx });
       });
     });
     return { ...m, assignments, score: snap[mi] || { ...score }, count: monthCount[mi] };
@@ -266,25 +321,48 @@ function CommitInput({ value, onCommit, style }) {
   );
 }
 
+// Petit champ : créer une habilitation (tag) à la volée depuis un poste.
+function NewHabInput({ placeholder, onAdd }) {
+  const [v, setV] = useState("");
+  const submit = () => { const n = v.trim(); if (n) { onAdd(n); setV(""); } };
+  return (
+    <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+      <input
+        value={v}
+        placeholder={placeholder}
+        onChange={(e) => setV(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+        style={{ flex: 1, background: "var(--panel2)", border: "1px dashed var(--line)", borderRadius: 8, color: "var(--ink)", fontFamily: "'Spline Sans Mono', monospace", fontSize: 12, padding: "7px 9px" }}
+      />
+      <button
+        onClick={submit}
+        style={{ background: "transparent", border: "1px solid var(--cool)", color: "var(--cool)", borderRadius: 8, fontFamily: "'Spline Sans Mono', monospace", fontSize: 16, lineHeight: 1, padding: "0 12px", cursor: "pointer" }}
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
 // Dictionnaire de traduction FR / EN.
 const TR = {
   fr: {
     appSub: "astreintes équitables · perso",
     exercise: "Exercice", durationAria: "Durée de l'exercice", months: "mois", days: "jours",
     themeAria: "Changer de thème", langAria: "Langue",
-    tMois: "Mois", tBourse: "Bourse", tSemestre: "Semestre", tStats: "Stats", tEquipe: "Équipe", tPostes: "Postes",
+    tMois: "Mois", tBourse: "Bourse", tSemestre: "Semestre", tStats: "Stats", tEquipe: "Équipe", tPostes: "Postes", tPlanning: "Planning",
     undo: "↶ Annuler", redo: "Rétablir ↷",
     responsable: "Responsable", validated: "✓ Validé", brouillon: "Brouillon",
     planifier: "Planifier", indispos: "Indispos",
     tapDay: "Touche un jour pour voir et modifier les astreintes.",
-    validationTitle: "Validation du mois", each: "Chaque interne se prononce ;", validates: "valide.",
+    validationTitle: "Validation du mois", each: "Chaque personne se prononce ;", validates: "valide.",
     pour: "pour", contre: "contre", validerMois: "Valider le mois", annulerValidation: "Annuler la validation",
     auto: "Auto (algorithme)", leaveEmpty: "— laisser vide —", notQualified: " (non habilité)",
     manual: "manuel", uncovered: "non couvert", weeklyNote: "Astreinte hebdomadaire — modifier ici réassigne toute la semaine.",
     swap: "Échanger", listed: "à la bourse", assignTo: "Attribuer à :", noReplacement: "aucun remplaçant habilité",
     bourseEmpty: "Aucune garde proposée à l'échange pour l'instant.",
     spreadLabel: "écart final de charge (max − min)", spreadSub: "plus c'est bas, plus c'est équitable",
-    cumLoad: "Charge cumulée", cumUpTo: "cumul jusqu'à", included: "inclus",
+    cumLoad: "Charge cumulée", cumUpTo: "cumul jusqu'à", wholePeriod: "sur toute la période", included: "inclus",
     exportTitle: "Exporter le planning",
     exportHint: "Agenda (.ics) à importer dans un calendrier, tableau (.csv) pour Excel, ou impression / PDF.",
     everyone: "Toutes les personnes", only: "seulement", btnIcs: "Agenda .ics", btnCsv: "Tableau .csv",
@@ -295,14 +373,20 @@ const TR = {
     habTitle: "Habilitations",
     habHint: "Qui peut couvrir quel poste. Coche les habilitations de chaque personne ci-dessous.",
     addHab: "+ Ajouter une habilitation", addIntern: "+ Ajouter un interne", newHab: "Nouvelle habilitation",
+    addOne: "Ajouter", defRole: "collaborateur",
     ponderationTitle: "Pondération des jours",
     ponderationHint: "Combien « pèse » une garde selon le jour, pour le calcul d'équité. Un dimanche ou un férié plus lourd sera réparti plus équitablement.",
     wWeek: "Semaine", wSat: "Samedi", wSun: "Dimanche", wHol: "Férié", resetDefaults: "Valeurs par défaut",
     postesHint: "Définis les créneaux à couvrir chaque jour et les habilitations requises. Sans tag requis, le poste est ouvert à tout le monde.",
     typeLabel: "Type", kGarde: "Garde", kAstreinte: "Astreinte",
     cadenceLabel: "Cadence", cadJour: "Journalière", cadSemaine: "Hebdomadaire",
+    cadBloc: "Plusieurs jours", cadWe: "Week-end", cadSem5: "Semaine (Lu–Ve)", sem5Short: "Lu–Ve", spanLabel: "Nombre de jours", dayShort: "j",
+    periodNote: "Astreinte sur plusieurs jours — modifier ici réassigne tout le bloc.",
+    genLive: "à jour", genComputing: "calcul…", roleLabelSetting: "Terme pour les personnes",
+    loadOver: "charge sur",
     reqHab: "Habilitations requises", addPoste: "+ Ajouter un poste", newPoste: "Nouveau poste",
-    eligibleA: "éligible", eligibleP: "éligibles", nobodyElig: "personne n'est habilité — créneau non couvrable",
+    newHabPlaceholder: "Nouvelle habilitation…", assignInTeam: "attribue-la dans l'onglet Équipe",
+    eligibleA: "éligible", eligibleP: "éligibles", nobodyElig: "personne n'est habilité — créneau non couvrable", onlyOneA: "seul(e) ", onlyOneB: " peut couvrir ce poste — charge concentrée sur cette personne", fewEligA: "", fewEligB: " seulement peuvent couvrir ce poste — risque de charge concentrée",
     weekly: "hebdo",
     footVersion: "Version perso · enregistré automatiquement sur ton appareil", resetData: "Réinitialiser les données",
     loading: "Chargement…", warnPeriod: "Génère d'abord une période valide.",
@@ -314,7 +398,7 @@ const TR = {
     dHol: "férié", dWE: "week-end",
     unavailA: "Touche les jours où ", unavailB: " n'est pas disponible. Le planning les évite.",
     semIntroA: "L'équité se cumule sur les ", semIntroB: " mois de l'exercice : le report de chaque mois alimente le suivant pour égaliser la charge.",
-    habManageHint: "Renomme, ajoute ou supprime une habilitation. Les internes et les postes se mettent à jour automatiquement.",
+    habManageHint: "Renomme, ajoute ou supprime une habilitation. Les personnes et les postes se mettent à jour automatiquement.",
     teamEditHint: "Édite l'équipe : touche le nom pour le changer, règle le report, coche les habilitations. Tout se recalcule en direct.",
     report: "Report",
     bourseIntro: "Bourse aux astreintes : propose une astreinte à l'échange (depuis l'onglet Mois, bouton « Échanger »), puis attribue-la ici à un remplaçant.",
@@ -326,7 +410,7 @@ const TR = {
     appSub: "fair on-call rota · personal",
     exercise: "Period", durationAria: "Exercise duration", months: "months", days: "days",
     themeAria: "Toggle theme", langAria: "Language",
-    tMois: "Month", tBourse: "Swaps", tSemestre: "Overview", tStats: "Stats", tEquipe: "Team", tPostes: "Slots",
+    tMois: "Month", tBourse: "Swaps", tSemestre: "Overview", tStats: "Stats", tEquipe: "Team", tPostes: "Slots", tPlanning: "Planning",
     undo: "↶ Undo", redo: "Redo ↷",
     responsable: "In charge", validated: "✓ Validated", brouillon: "Draft",
     planifier: "Plan", indispos: "Off days",
@@ -338,7 +422,7 @@ const TR = {
     swap: "Swap", listed: "listed", assignTo: "Assign to:", noReplacement: "no qualified replacement",
     bourseEmpty: "No shift offered for swap yet.",
     spreadLabel: "final load gap (max − min)", spreadSub: "lower is fairer",
-    cumLoad: "Cumulative load", cumUpTo: "cumulative through", included: "",
+    cumLoad: "Cumulative load", cumUpTo: "cumulative through", wholePeriod: "over the whole period", included: "",
     exportTitle: "Export the schedule",
     exportHint: "Calendar (.ics) to import into an agenda, table (.csv) for Excel, or print / PDF.",
     everyone: "Everyone", only: "only", btnIcs: "Calendar .ics", btnCsv: "Table .csv",
@@ -349,14 +433,20 @@ const TR = {
     habTitle: "Qualifications",
     habHint: "Who can cover which slot. Tick each person's qualifications below.",
     addHab: "+ Add a qualification", addIntern: "+ Add a person", newHab: "New qualification",
+    addOne: "Add", defRole: "member",
     ponderationTitle: "Day weighting",
     ponderationHint: "How much a shift \"weighs\" depending on the day, for the fairness calculation. A heavier Sunday or holiday will be shared out more evenly.",
     wWeek: "Weekday", wSat: "Saturday", wSun: "Sunday", wHol: "Holiday", resetDefaults: "Reset to defaults",
     postesHint: "Define the slots to cover each day and the required qualifications. With no required tag, the slot is open to everyone.",
     typeLabel: "Type", kGarde: "On-site", kAstreinte: "On-call",
     cadenceLabel: "Cadence", cadJour: "Daily", cadSemaine: "Weekly",
+    cadBloc: "Multi-day", cadWe: "Weekend", cadSem5: "Week (Mon–Fri)", sem5Short: "Mo–Fr", spanLabel: "Number of days", dayShort: "d",
+    periodNote: "Multi-day on-call — editing here reassigns the whole block.",
+    genLive: "up to date", genComputing: "computing…", roleLabelSetting: "Term for people",
+    loadOver: "load over",
     reqHab: "Required qualifications", addPoste: "+ Add a slot", newPoste: "New slot",
-    eligibleA: "eligible", eligibleP: "eligible", nobodyElig: "nobody is qualified — slot cannot be covered",
+    newHabPlaceholder: "New qualification…", assignInTeam: "assign it in the Team tab",
+    eligibleA: "eligible", eligibleP: "eligible", nobodyElig: "nobody is qualified — slot cannot be covered", onlyOneA: "only ", onlyOneB: " can cover this slot — load will concentrate on this person", fewEligA: "only ", fewEligB: " can cover this slot — load may concentrate",
     weekly: "weekly",
     footVersion: "Personal version · saved automatically on your device", resetData: "Reset all data",
     loading: "Loading…", warnPeriod: "Set a valid period first.",
@@ -422,6 +512,7 @@ class ErrorBoundary extends React.Component {
 function AppInner() {
   const [interns, setInterns] = useState(SEED_INTERNS);
   const [tab, setTab] = useState("mois");
+  const [moisView, setMoisView] = useState("mois");
   const [sel, setSel] = useState(null);
   const [mode, setMode] = useState("plan"); // plan | indispo
   const [activePerson, setActivePerson] = useState(SEED_INTERNS[0].id);
@@ -441,9 +532,11 @@ function AppInner() {
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
   const [theme, setTheme] = useState("dark");
   const [lang, setLang] = useState("fr");
+  const [roleLabel, setRoleLabel] = useState("");
   const tx = (k) => (TR[lang] && TR[lang][k]) || TR.fr[k] || k;
   const MONTHS = MONTH_NAMES[lang] || MONTH_NAMES.fr;
   const DOWL = DOW_NAMES[lang] || DOW_NAMES.fr;
+  const roleName = (roleLabel && roleLabel.trim()) || tx("defRole");
   const [exportWho, setExportWho] = useState("all");
   const [loaded, setLoaded] = useState(false);
 
@@ -472,6 +565,7 @@ function AppInner() {
             if (d.weights) setWeights({ ...DEFAULT_WEIGHTS, ...d.weights });
             if (d.theme) setTheme(d.theme);
             if (d.lang) setLang(d.lang);
+            if (d.roleLabel !== undefined) setRoleLabel(d.roleLabel);
           }
         }
       } catch (e) {
@@ -486,10 +580,10 @@ function AppInner() {
   // Sauvegarde automatique (débouncée) à chaque modification.
   useEffect(() => {
     if (!loaded || typeof window === "undefined" || !storage) return;
-    const data = JSON.stringify({ interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang });
+    const data = JSON.stringify({ interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang, roleLabel });
     const t = setTimeout(() => { storage.set("rota:state", data).catch(() => {}); }, 400);
     return () => clearTimeout(t);
-  }, [loaded, interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang]);
+  }, [loaded, interns, posts, unavail, startISO, endISO, activePerson, overrides, offers, votes, validated, respo, tagList, weights, theme, lang, roleLabel]);
 
   async function resetAll() {
     try { if (typeof window !== "undefined" && storage) await storage.delete("rota:state"); } catch (e) {}
@@ -515,6 +609,7 @@ function AppInner() {
   const dUnavail = useDeferred(unavail);
   const dOverrides = useDeferred(overrides);
   const dWeights = useDeferred(weights);
+  const computing = dInterns !== interns || dPosts !== posts || dUnavail !== unavail || dOverrides !== overrides || dWeights !== weights;
   const sem = useMemo(
     () => (valid ? simulateSemester(dInterns, dPosts, dUnavail, months, dOverrides, dWeights) : []),
     [dInterns, dPosts, dUnavail, months, valid, dOverrides, dWeights]
@@ -527,7 +622,6 @@ function AppInner() {
   const safeMonth = Math.min(selMonth, Math.max(0, sem.length - 1));
   const cur = sem[safeMonth]; // mois affiché dans l'onglet Mois
 
-  const maxScore = cur ? Math.max(...Object.values(cur.score), 1) : 1;
   const internMap = useMemo(() => { const m = {}; interns.forEach((i) => (m[i.id] = i)); return m; }, [interns]);
   const postMap = useMemo(() => { const m = {}; posts.forEach((p) => (m[p.id] = p)); return m; }, [posts]);
   const byId = (id) => internMap[id];
@@ -759,7 +853,7 @@ function AppInner() {
   function addIntern() {
     const id = Math.max(0, ...interns.map((i) => i.id)) + 1;
     const color = PALETTE[interns.length % PALETTE.length];
-    setInterns((p) => [...p, { id, name: tx("defIntern") + " " + id, tags: [], carry: 0, color }]);
+    setInterns((p) => [...p, { id, name: roleName + " " + id, tags: [], carry: 0, color }]);
   }
   function removeIntern(id) {
     setInterns((p) => (p.length > 1 ? p.filter((i) => i.id !== id) : p));
@@ -793,7 +887,7 @@ function AppInner() {
   function addPost() {
     const id = "p" + Date.now();
     const color = PALETTE[posts.length % PALETTE.length];
-    setPosts((p) => [...p, { id, label: tx("defPoste"), requires: [], color, kind: "garde", cadence: "jour" }]);
+    setPosts((p) => [...p, { id, label: tx("defPoste"), requires: [], color, kind: "garde", cadence: "jour", span: 3 }]);
   }
   function removePost(id) {
     setPosts((p) => (p.length > 1 ? p.filter((x) => x.id !== id) : p));
@@ -817,6 +911,20 @@ function AppInner() {
   }
   function setPostField(id, field, value) {
     setPosts((p) => p.map((x) => (x.id === id ? { ...x, [field]: value } : x)));
+  }
+  // Créer une habilitation depuis un poste : l'ajoute à la liste (donc visible dans
+  // Équipe) et la marque requise sur ce poste.
+  function addTagToPost(postId, rawName) {
+    const name = (rawName || "").trim();
+    if (!name) return;
+    setTagList((l) => (l.includes(name) ? l : [...l, name]));
+    setPosts((p) =>
+      p.map((x) =>
+        x.id === postId
+          ? { ...x, requires: x.requires.includes(name) ? x.requires : [...x.requires, name] }
+          : x
+      )
+    );
   }
 
   const lastSem = sem.length ? sem[sem.length - 1] : null;
@@ -925,9 +1033,8 @@ function AppInner() {
 
       <nav style={S.tabs}>
         {[
-          ["mois", tx("tMois")],
+          ["mois", tx("tPlanning")],
           ["bourse", tx("tBourse") + (offers.length ? " (" + offers.length + ")" : "")],
-          ["semestre", tx("tSemestre")],
           ["stats", tx("tStats")],
           ["equipe", tx("tEquipe")],
           ["postes", tx("tPostes")],
@@ -942,10 +1049,23 @@ function AppInner() {
         ))}
       </nav>
 
+      <div style={S.genBar}>
+        <span style={{ ...S.genPill, ...(computing ? S.genPillBusy : S.genPillOk) }}>
+          {computing ? "⟳ " + tx("genComputing") : "✓ " + tx("genLive")}
+        </span>
+      </div>
+
       {/* ---------------- MOIS ---------------- */}
       {tab === "mois" && (
         <section style={S.body}>
-          {!valid || !cur ? (
+          <div style={S.viewSwitch}>
+            {[["mois", tx("tMois")], ["semestre", tx("tSemestre")]].map(([v, l]) => (
+              <button key={v} onClick={() => setMoisView(v)}
+                style={{ ...S.viewBtn, ...(moisView === v ? S.viewBtnOn : {}) }}>{l}</button>
+            ))}
+          </div>
+          {moisView === "mois" && (
+          !valid || !cur ? (
             <div style={S.warn}>
               {tx("warnPeriod")}
             </div>
@@ -1037,10 +1157,10 @@ function AppInner() {
 
           <div style={S.legend}>
             {mode === "plan" ? (
-              interns.map((p) => (
-                <span key={p.id} style={S.legendItem}>
-                  <span style={{ ...S.legendDot, background: p.color }} />
-                  {p.name}
+              posts.map((po) => (
+                <span key={po.id} style={S.legendItem}>
+                  <span style={{ ...S.legendRing, borderColor: po.color }} />
+                  {po.label}
                 </span>
               ))
             ) : (
@@ -1063,6 +1183,7 @@ function AppInner() {
             {cur.days.map((day, dIdx) => {
               const a = assignByDay[dIdx] || [];
               const special = day.holiday || day.wd === 5 || day.wd === 6;
+              const uncovered = a.some((x) => x.intern == null);
               const isSel = sel === dIdx;
               const off = unavail[selMonth + "-" + activePerson + "-" + dIdx];
               if (!day.inRange) {
@@ -1083,6 +1204,7 @@ function AppInner() {
                   style={{
                     ...S.cell,
                     ...(special ? S.cellSpecial : {}),
+                    ...(mode === "plan" && uncovered ? S.cellAlert : {}),
                     ...(mode === "plan" && isSel ? S.cellSel : {}),
                     ...(mode === "indispo" && off
                       ? { background: byId(activePerson)?.color, borderColor: byId(activePerson)?.color }
@@ -1101,14 +1223,17 @@ function AppInner() {
                     <div style={S.dots}>
                       {a.map((x, k) => {
                         const who = x.intern ? byId(x.intern) : null;
+                        const po = postById(x.post);
+                        const ring = po ? po.color : "var(--line)";
                         return (
                           <span
                             key={k}
+                            title={po ? po.label + (who ? " · " + who.name : "") : ""}
                             style={{
                               ...S.dot,
                               background: who ? who.color : "transparent",
                               color: who ? textOn(who.color) : "transparent",
-                              border: who ? "none" : "1.5px solid var(--hot)",
+                              border: who ? "2.5px solid " + ring : "2px dashed " + ring,
                             }}
                           >
                             {who ? who.name.charAt(0).toUpperCase() : ""}
@@ -1141,19 +1266,24 @@ function AppInner() {
                       const it = byId(x.intern);
                       const p = postById(x.post);
                       if (!p) return null;
-                      const weekly = p.cadence === "semaine";
-                      const editIdx = weekly ? weekAnchor(cur.days, sel) : sel;
-                      const okey = safeMonth + "-" + editIdx + "-" + x.post;
+                      const isPer = p.cadence === "semaine" || p.cadence === "we" || p.cadence === "sem5" || (p.cadence === "bloc" && (p.span || 1) >= 2);
+                      const editMi = isPer ? x.anchorMi : safeMonth;
+                      const editIdx = isPer ? x.anchorDIdx : sel;
+                      const okey = editMi + "-" + editIdx + "-" + x.post;
                       const ov = overrides[okey];
                       const selVal = ov === undefined ? "auto" : (ov === "" ? "" : String(ov));
-                      const isOffered = offers.some((o) => o.monthIdx === safeMonth && o.dIdx === editIdx && o.postId === x.post);
+                      const isOffered = offers.some((o) => o.monthIdx === editMi && o.dIdx === editIdx && o.postId === x.post);
                       const badHab = it && !p.requires.every((t) => it.tags.includes(t));
+                      const cadenceTag = p.cadence === "semaine" ? " · " + tx("weekly")
+                        : p.cadence === "we" ? " · " + tx("cadWe")
+                        : p.cadence === "sem5" ? " · " + tx("sem5Short")
+                        : (isPer ? " · " + (p.span || 1) + tx("dayShort") : "");
                       return (
                         <div key={k} style={S.editRow}>
                           <div style={S.editTop}>
                             <span style={S.detailPost}>
                               {p.label}
-                              <span style={S.kindTag}>{(p.kind || "garde") === "astreinte" ? tx("kAstreinte") : tx("kGarde")}{weekly ? " · " + tx("weekly") : ""}</span>
+                              <span style={S.kindTag}>{(p.kind || "garde") === "astreinte" ? tx("kAstreinte") : tx("kGarde")}{cadenceTag}</span>
                             </span>
                             <span style={S.editTag}>
                               {x.intern && it && (<span style={{ ...S.detailDot, background: it.color }} />)}
@@ -1161,13 +1291,13 @@ function AppInner() {
                               {x.forced && <span style={S.forcedTag}>{tx("manual")}</span>}
                             </span>
                           </div>
-                          {weekly && <div style={S.weekNote}>{tx("weeklyNote")}</div>}
+                          {isPer && <div style={S.weekNote}>{tx("periodNote")}</div>}
                           <div style={S.editCtrls}>
                             <select
                               value={selVal}
                               onChange={(e) => {
                                 const v = e.target.value;
-                                setOverride(safeMonth, editIdx, x.post, v === "auto" ? null : (v === "" ? "" : Number(v)));
+                                setOverride(editMi, editIdx, x.post, v === "auto" ? null : (v === "" ? "" : Number(v)));
                               }}
                               style={S.editSelect}
                             >
@@ -1181,7 +1311,7 @@ function AppInner() {
                             {x.intern && (
                               isOffered
                                 ? <span style={S.offeredTag}>{tx("listed")}</span>
-                                : <button style={S.offerBtn} onClick={() => offerShift(safeMonth, editIdx, x.post)}>{tx("swap")}</button>
+                                : <button style={S.offerBtn} onClick={() => offerShift(editMi, editIdx, x.post)}>{tx("swap")}</button>
                             )}
                           </div>
                           {badHab && <div style={S.habWarn}>⚠ {it.name} {tx("notQualifiedFor")} {p.label}</div>}
@@ -1231,6 +1361,7 @@ function AppInner() {
             </div>
           </div>
           </>
+          )
           )}
         </section>
       )}
@@ -1291,7 +1422,7 @@ function AppInner() {
       )}
 
       {/* ---------------- SEMESTRE ---------------- */}
-      {tab === "semestre" && (
+      {tab === "mois" && moisView === "semestre" && (
         <section style={S.body}>
           {!valid ? (
             <div style={S.warn}>
@@ -1471,6 +1602,16 @@ function AppInner() {
             <button onClick={addTag} style={S.addBtn}>{tx("addHab")}</button>
           </div>
 
+          <div style={S.roleRow}>
+            <span style={S.wLabel}>{tx("roleLabelSetting")}</span>
+            <input
+              value={roleLabel}
+              placeholder={tx("defRole")}
+              onChange={(e) => setRoleLabel(e.target.value)}
+              style={S.roleInput}
+            />
+          </div>
+
           <div style={S.teamHint}>
             {tx("teamEditHint")}
           </div>
@@ -1511,7 +1652,7 @@ function AppInner() {
               </div>
             </div>
           ))}
-          <button onClick={addIntern} style={S.addBtn}>{tx("addIntern")}</button>
+          <button onClick={addIntern} style={S.addBtn}>{"+ " + tx("addOne") + " " + roleName}</button>
         </section>
       )}
 
@@ -1547,9 +1688,8 @@ function AppInner() {
             {tx("postesHint")}
           </div>
           {posts.map((p) => {
-            const eligibleCount = interns.filter((i) =>
-              p.requires.every((t) => i.tags.includes(t))
-            ).length;
+            const eligible = interns.filter((i) => p.requires.every((t) => i.tags.includes(t)));
+            const eligibleCount = eligible.length;
             return (
               <div key={p.id} style={S.internCard}>
                 <div style={S.internTop}>
@@ -1569,12 +1709,34 @@ function AppInner() {
                   ))}
                 </div>
                 <div style={S.segLabel}>{tx("cadenceLabel")}</div>
-                <div style={S.seg}>
-                  {[["jour", tx("cadJour")], ["semaine", tx("cadSemaine")]].map(([v, l]) => (
-                    <button key={v} onClick={() => setPostField(p.id, "cadence", v)}
-                      style={{ ...S.segBtn, ...((p.cadence || "jour") === v ? S.segOn : {}) }}>{l}</button>
-                  ))}
-                </div>
+                <select
+                  value={p.cadence || "jour"}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setPosts((ps) => ps.map((x) => x.id === p.id ? { ...x, cadence: v, ...(v === "bloc" && !x.span ? { span: 3 } : {}) } : x));
+                  }}
+                  style={S.cadenceSelect}
+                >
+                  <option value="jour">{tx("cadJour")}</option>
+                  <option value="bloc">{tx("cadBloc")}</option>
+                  <option value="sem5">{tx("cadSem5")}</option>
+                  <option value="we">{tx("cadWe")}</option>
+                  <option value="semaine">{tx("cadSemaine")}</option>
+                </select>
+                {p.cadence === "bloc" && (
+                  <div style={S.spanRow}>
+                    <span style={S.wLabel}>{tx("spanLabel")}</span>
+                    <input
+                      type="number" min="2" max="31" step="1"
+                      value={p.span || 3}
+                      onChange={(e) => {
+                        const n = parseInt(e.target.value, 10);
+                        setPostField(p.id, "span", isNaN(n) ? 2 : Math.max(2, n));
+                      }}
+                      style={S.wInput}
+                    />
+                  </div>
+                )}
 
                 <div style={S.reqLabel}>{tx("reqHab")}</div>
                 <div style={S.tagRow}>
@@ -1591,14 +1753,19 @@ function AppInner() {
                     );
                   })}
                 </div>
+                <NewHabInput placeholder={tx("newHabPlaceholder")} onAdd={(name) => addTagToPost(p.id, name)} />
                 <div
                   style={{
                     ...S.eligNote,
-                    color: eligibleCount === 0 ? "var(--hot)" : "var(--muted)",
+                    color: eligibleCount === 0 ? "var(--hot)" : eligibleCount <= 2 ? "var(--mid)" : "var(--muted)",
                   }}
                 >
                   {eligibleCount === 0
-                    ? "⚠ " + tx("nobodyElig")
+                    ? "⚠ " + tx("nobodyElig") + " — " + tx("assignInTeam")
+                    : eligibleCount === 1
+                    ? "⚠ " + tx("onlyOneA") + eligible[0].name + tx("onlyOneB")
+                    : eligibleCount === 2
+                    ? "⚠ " + tx("fewEligA") + eligible.map((e) => e.name).join(", ") + tx("fewEligB")
                     : eligibleCount + " " + (eligibleCount > 1 ? tx("eligibleP") : tx("eligibleA"))}
                 </div>
               </div>
@@ -1612,30 +1779,28 @@ function AppInner() {
       {cur && (
       <section style={S.equityCard}>
         <div style={S.equityTitle}>
-          {tx("cumLoad")} <span style={S.equityHint}>{tx("cumUpTo")} {MONTHS[cur.monthIdx]} {tx("included")}</span>
+          {tx("cumLoad")} <span style={S.equityHint}>{startISO.split("-").reverse().join("/")} → {endISO.split("-").reverse().join("/")} · {tx("wholePeriod")}</span>
         </div>
-        {interns
-          .slice()
-          .sort((a, b) => cur.score[b.id] - cur.score[a.id])
-          .map((i) => {
-            const sc = cur.score[i.id] || 0;
-            const pct = (sc / maxScore) * 100;
-            return (
-              <div key={i.id} style={S.barRow}>
-                <div style={S.barName}>{i.name}</div>
-                <div style={S.barTrack}>
-                  <div
-                    style={{
-                      ...S.barFill,
-                      width: pct + "%",
-                      background: i.color,
-                    }}
-                  />
+        {(() => {
+          const load = (lastSem && lastSem.score) || cur.score;
+          const maxLoad = Math.max(...Object.values(load).map((v) => v || 0), 1);
+          return interns
+            .slice()
+            .sort((a, b) => (load[b.id] || 0) - (load[a.id] || 0))
+            .map((i) => {
+              const sc = load[i.id] || 0;
+              const pct = (sc / maxLoad) * 100;
+              return (
+                <div key={i.id} style={S.barRow}>
+                  <div style={S.barName}>{i.name}</div>
+                  <div style={S.barTrack}>
+                    <div style={{ ...S.barFill, width: pct + "%", background: i.color }} />
+                  </div>
+                  <div style={S.barScore}>{sc.toFixed(1)}</div>
                 </div>
-                <div style={S.barScore}>{sc.toFixed(1)}</div>
-              </div>
-            );
-          })}
+              );
+            });
+        })()}
         <div style={S.equityFoot}>
           {tx("equityFoot")}
         </div>
@@ -1724,6 +1889,7 @@ const S = {
   legend: { display: "flex", gap: 14, marginBottom: 12, flexWrap: "wrap" },
   legendItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--muted)" },
   legendDot: { width: 9, height: 9, borderRadius: "50%" },
+  legendRing: { width: 11, height: 11, borderRadius: "50%", border: "2.5px solid", background: "transparent", boxSizing: "border-box" },
 
   weekHead: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4, marginBottom: 5 },
   weekHeadCell: { textAlign: "center", fontSize: 10, color: "var(--muted)", letterSpacing: 0.3 },
@@ -1731,12 +1897,13 @@ const S = {
   blank: { aspectRatio: "1 / 1.15" },
   cell: { aspectRatio: "1 / 1.15", background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 9, padding: "4px 0 0", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "space-between", cursor: "pointer", fontFamily: mono },
   cellSpecial: { background: "var(--panel2)", borderColor: "rgba(240,201,135,.35)" },
+  cellAlert: { background: "rgba(224,97,60,.12)", borderColor: "var(--hot)" },
   cellSel: { borderColor: "var(--accent)", boxShadow: "0 0 0 1px var(--accent)" },
   cellOut: { background: "transparent", border: "1px dashed var(--line)", opacity: 0.4, cursor: "default" },
   cellNumOut: { fontSize: 11, color: "var(--muted)" },
   cellNum: { fontSize: 12, color: "var(--ink)", fontWeight: 500 },
   dots: { display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 3, paddingBottom: 6 },
-  dot: { width: 13, height: 13, borderRadius: "50%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontWeight: 700, lineHeight: 1, fontFamily: mono },
+  dot: { width: 16, height: 16, borderRadius: "50%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8.5, fontWeight: 700, lineHeight: 1, fontFamily: mono },
 
   detail: { marginTop: 14, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: 14, minHeight: 70 },
   detailHint: { fontSize: 12, color: "var(--muted)", lineHeight: 1.5 },
@@ -1811,6 +1978,17 @@ const S = {
   seg: { display: "flex", gap: 6, background: "var(--panel2)", padding: 4, borderRadius: 10 },
   segBtn: { flex: 1, padding: "8px 0", background: "transparent", border: "none", borderRadius: 7, color: "var(--muted)", fontFamily: mono, fontSize: 12, cursor: "pointer" },
   segOn: { background: "var(--ink)", color: "var(--paper)", fontWeight: 600 },
+  spanRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 8, background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 10, padding: "8px 10px" },
+  roleRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 14px", marginBottom: 12 },
+  roleInput: { flex: 1, maxWidth: 180, background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 8, color: "var(--ink)", fontFamily: mono, fontSize: 13, padding: "8px 10px", textAlign: "right" },
+  genBar: { display: "flex", justifyContent: "center", padding: "0 16px 6px" },
+  genPill: { fontSize: 10.5, fontFamily: mono, borderRadius: 20, padding: "3px 10px", border: "1px solid var(--line)" },
+  genPillOk: { color: "var(--cool)", borderColor: "var(--cool)" },
+  genPillBusy: { color: "var(--mid)", borderColor: "var(--mid)" },
+  viewSwitch: { display: "flex", gap: 6, background: "var(--panel2)", padding: 4, borderRadius: 12, marginBottom: 14 },
+  viewBtn: { flex: 1, padding: "9px 0", background: "transparent", border: "none", borderRadius: 8, color: "var(--muted)", fontFamily: mono, fontSize: 13, cursor: "pointer" },
+  viewBtnOn: { background: "var(--panel)", color: "var(--ink)", fontWeight: 600 },
+  cadenceSelect: { width: "100%", background: "var(--panel2)", color: "var(--ink)", border: "1px solid var(--line)", borderRadius: 9, fontFamily: mono, fontSize: 13, padding: "9px 10px" },
   kindTag: { fontSize: 9.5, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 10, padding: "1px 6px", marginLeft: 7, textTransform: "uppercase", letterSpacing: 0.5 },
   weekNote: { fontSize: 10.5, color: "var(--muted)", marginBottom: 8, fontStyle: "italic" },
   eligNote: { fontSize: 11, marginTop: 10, lineHeight: 1.4 },
